@@ -2,7 +2,7 @@
 
 One section per milestone. Keep entries in STE-flavored English.
 
-## M0 — Cluster and CSI lab
+## M0
 
 ### What I tried
 
@@ -12,7 +12,7 @@ One section per milestone. Keep entries in STE-flavored English.
 
 ### Interview notes
 
-## M1 — RecoveryPolicy CRD and first handler
+## M1
 
 ### What I tried
 
@@ -22,7 +22,7 @@ One section per milestone. Keep entries in STE-flavored English.
 
 ### Interview notes
 
-## M2 — VolumeSnapshot backups
+## M2
 
 ### What I tried
 
@@ -32,7 +32,7 @@ One section per milestone. Keep entries in STE-flavored English.
 
 ### Interview notes
 
-## M3 — Pod failure recovery
+## M3
 
 ### What I tried
 
@@ -42,7 +42,7 @@ One section per milestone. Keep entries in STE-flavored English.
 
 ### Interview notes
 
-## M4 — Node failure and fencing
+## M4
 
 ### What I tried
 
@@ -52,7 +52,7 @@ One section per milestone. Keep entries in STE-flavored English.
 
 ### Interview notes
 
-## M5 — Volume failure recovery
+## M5
 
 ### What I tried
 
@@ -62,7 +62,7 @@ One section per milestone. Keep entries in STE-flavored English.
 
 ### Interview notes
 
-## M6 — Metrics and dashboards
+## M6
 
 ### What I tried
 
@@ -72,7 +72,7 @@ One section per milestone. Keep entries in STE-flavored English.
 
 ### Interview notes
 
-## M7 — End-to-end runs and write-up
+## M7
 
 ### What I tried
 
