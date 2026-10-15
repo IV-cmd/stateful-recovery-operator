@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ".[dev]"
+      - run: ruff check .
+      - run: mypy recovery_operator
+      # shortcut: no tests yet (pytest exit 5), drop this once M1 adds unit tests
+      - run: pytest -q; code=$?; [ $code -eq 0 ] || [ $code -eq 5 ]
+
+  lint-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python scripts/ste-lint.py --baseline 5 README.md LEARNING_LOG.md
