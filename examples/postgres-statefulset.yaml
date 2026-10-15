@@ -1,0 +1,2 @@
+# TODO(M0): Postgres StatefulSet with PVCs for the recovery lab.
+# The owner writes this manifest in milestone M0.
