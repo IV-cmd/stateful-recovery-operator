@@ -7,10 +7,10 @@ help:
 	@awk '/^## /{desc=substr($$0,4)} /^[a-zA-Z_-]+:/{if(desc){printf "  %-16s %s\n", substr($$1,1,length($$1)-1), desc; desc=""}}' Makefile
 
 ## Create the recovery-lab kind cluster
-cluster: ; @echo "TODO(M0): kind cluster"
+cluster: ; kind create cluster --name recovery-lab --config kind.yaml
 
 ## Delete the recovery-lab kind cluster
-cluster-delete: ; @echo "TODO(M0): kind delete cluster"
+cluster-delete: ; kind delete cluster --name recovery-lab
 
 ## Show the CSI lab install steps (installs nothing)
 csi:
