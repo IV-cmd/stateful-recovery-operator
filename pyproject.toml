@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stateful-recovery-operator"
+version = "0.1.0"
+description = "Kopf operator that backs up and recovers StatefulSets with CSI VolumeSnapshots"
+requires-python = ">=3.11"
+dependencies = [
+    "kopf",
+    "kubernetes",
+    "prometheus_client",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools]
+packages = ["recovery_operator"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
