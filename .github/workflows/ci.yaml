@@ -16,7 +16,7 @@ jobs:
       - run: ruff check .
       - run: mypy recovery_operator
       # shortcut: no tests yet (pytest exit 5), drop this once M1 adds unit tests
-      - run: pytest -q; code=$?; [ $code -eq 0 ] || [ $code -eq 5 ]
+      - run: pytest -q || [ $? -eq 5 ]
 
   lint-docs:
     runs-on: ubuntu-latest
