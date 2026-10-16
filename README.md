@@ -21,7 +21,7 @@ This is a learning project. The owner writes all implementation code.
 ## Quick start
 
 1. Run `make cluster` to create the kind cluster.
-2. Run `make csi` to show the CSI install steps.
+2. Run `make csi` to install the CSI snapshot lab.
 3. Run `make deploy` to apply the manifests in `deploy/`.
 
 ## Architecture

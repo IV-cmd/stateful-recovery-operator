@@ -1,5 +1,9 @@
 .DEFAULT_GOAL := help
 
+# must match the csi-snapshotter sidecar in the pinned csi-driver-host-path release
+SNAPSHOTTER_VERSION := v8.6.0
+HOSTPATH_VERSION := v1.18.0
+
 .PHONY: help cluster cluster-delete csi lint typecheck test deploy graph lint-docs
 
 ## Show this help
@@ -12,16 +16,16 @@ cluster: ; kind create cluster --name recovery-lab --config kind.yaml
 ## Delete the recovery-lab kind cluster
 cluster-delete: ; kind delete cluster --name recovery-lab
 
-## Show the CSI lab install steps (installs nothing)
+## Install the CSI snapshot lab (external-snapshotter + csi-driver-host-path)
 csi:
-	@echo "CSI lab steps (run manually, not installed by this target):"
-	@echo "  1. Install external-snapshotter CRDs:"
-	@echo "     kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/client/config/crd"
-	@echo "  2. Deploy the snapshot-controller:"
-	@echo "     kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/master/deploy/kubernetes/snapshot-controller"
-	@echo "  3. Deploy csi-driver-host-path:"
-	@echo "     See https://github.com/kubernetes-csi/csi-driver-host-path deploy scripts"
-	@echo "  4. Create a VolumeSnapshotClass for the hostpath driver."
+	kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/client/config/crd?ref=$(SNAPSHOTTER_VERSION)"
+	kubectl -n kube-system apply -k "https://github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/snapshot-controller?ref=$(SNAPSHOTTER_VERSION)"
+	kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=180s
+	tmp=$$(mktemp -d); trap 'rm -rf '$$tmp EXIT; \
+	git clone --depth 1 --branch $(HOSTPATH_VERSION) https://github.com/kubernetes-csi/csi-driver-host-path "$$tmp" && \
+	cd "$$tmp" && deploy/kubernetes-latest/deploy.sh && \
+	kubectl apply -f "$$tmp/examples/csi-storageclass.yaml" && \
+	kubectl apply -f "$$tmp/examples/csi-volumesnapshotclass.yaml"
 
 ## Run ruff
 lint: ; ruff check .
