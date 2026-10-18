@@ -1,2 +1,12 @@
-# TODO(M1): RecoveryPolicy custom resource example.
-# The owner writes this manifest in milestone M1.
+apiVersion: recovery.iv-cmd.dev/v1alpha1
+kind: RecoveryPolicy
+metadata:
+  name: postgres
+spec:
+  targetRef:
+    name: postgres
+  backup:
+    schedule: "*/30 * * * *"
+    retention: 3
+  recovery:
+    dryRun: true
