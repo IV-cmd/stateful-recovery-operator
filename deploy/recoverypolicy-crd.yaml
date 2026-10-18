@@ -1,0 +1,73 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: recoverypolicies.recovery.iv-cmd.dev
+spec:
+  group: recovery.iv-cmd.dev
+  scope: Namespaced
+  names:
+    kind: RecoveryPolicy
+    plural: recoverypolicies
+    singular: recoverypolicy
+    shortNames: [rp]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Target
+          type: string
+          jsonPath: .spec.targetRef.name
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [targetRef]
+              properties:
+                targetRef:
+                  description: The StatefulSet in the same namespace that this policy protects.
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                backup:
+                  type: object
+                  properties:
+                    schedule:
+                      description: Cron schedule for VolumeSnapshot backups.
+                      type: string
+                    retention:
+                      description: Number of snapshots to keep per PVC.
+                      type: integer
+                      minimum: 1
+                recovery:
+                  type: object
+                  # default {} so the dryRun default applies even when recovery is omitted.
+                  default: {}
+                  properties:
+                    maxConcurrentRecoveries:
+                      type: integer
+                      minimum: 1
+                      default: 1
+                    dryRun:
+                      description: Log recovery actions without executing them.
+                      type: boolean
+                      default: true
+            status:
+              type: object
+              # Kopf stores handler results and progress here; without this the API server prunes them silently.
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                phase:
+                  type: string
