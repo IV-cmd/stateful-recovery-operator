@@ -72,11 +72,11 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
     retention = spec.get("backup", {}).get("retention")
     if retention:
         for pvc in backup.pvc_names(sts):
-            ready = [
-                s for s in backup.list_snapshots(namespace, name, pvc)
-                if not backup.is_pending(s)
-            ]
-            for snap_name in backup.snapshots_to_prune(ready, retention):
+            snaps = backup.list_snapshots(namespace, name, pvc)
+            pending = {s["metadata"]["name"] for s in snaps if backup.is_pending(s)}
+            for snap_name in backup.snapshots_to_prune(snaps, retention):
+                if snap_name in pending:
+                    continue  # never delete an in-flight snapshot
                 try:
                     backup.delete_snapshot(namespace, snap_name)
                 except ApiException as e:
