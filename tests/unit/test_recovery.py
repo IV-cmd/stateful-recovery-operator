@@ -1,5 +1,6 @@
 """Unit tests for the pure recovery logic in recovery_operator.recovery."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from recovery_operator.recovery import (
@@ -124,6 +125,65 @@ def test_decide_zero_max_restarts_escalates():
     mem = PodMemory(uid="u")
     d = decide(view(crashloop_pod()), mem, Policy(0, 120, 1), 0, NOW)
     assert d.action is Action.ESCALATE
+
+
+def crashloop_view(name="postgres-0", uid="u1", node_ready=True):
+    return pod_view(crashloop_pod(name, uid), node_ready=node_ready)
+
+
+def test_observe_failing_since_starts_and_persists():
+    mem, _ = observe(crashloop_view(), PodMemory(), NOW)
+    assert mem.failing_since == NOW
+    # persists across replacement UIDs
+    mem, _ = observe(crashloop_view(uid="u2"), mem, NOW + timedelta(seconds=30))
+    assert mem.failing_since == NOW
+    # cleared on Ready
+    mem, _ = observe(pod_view(ready_pod(uid="u3")), mem, NOW + timedelta(seconds=60))
+    assert mem.failing_since is None
+
+
+def test_observe_node_outage_counts_nothing():
+    pod = crashloop_view(node_ready=False)
+    mem, _ = observe(pod, PodMemory(), NOW)
+    assert mem.unready_since is None and mem.failing_since is None
+    # a running unready clock is cleared while the node is down
+    mem, _ = observe(pod, PodMemory(uid="u1", unready_since=NOW), NOW)
+    assert mem.unready_since is None
+
+
+def test_decide_node_outage_never_escalates():
+    mem = PodMemory(uid="u1", restarts=3, unready_since=NOW - timedelta(hours=1))
+    d = decide(crashloop_view(node_ready=False), mem, POLICY, 0, NOW)
+    assert d.action is Action.WAIT and "node unhealthy" in d.reason
+
+
+def test_decide_restore_enabled_restores():
+    mem = PodMemory(uid="u1", restarts=2)
+    d = decide(crashloop_view(), mem, Policy(2, 120, 1, restore_enabled=True), 0, NOW)
+    assert d.action is Action.RESTORE
+
+
+def test_decide_restore_disabled_escalates():
+    mem = PodMemory(uid="u1", restarts=2)
+    d = decide(crashloop_view(), mem, Policy(2, 120, 1), 0, NOW)
+    assert d.action is Action.ESCALATE
+
+
+def test_decide_restored_pod_escalates_not_restores():
+    mem = PodMemory(uid="u1", restarts=2, restored=True)
+    d = decide(crashloop_view(), mem, Policy(2, 120, 1, restore_enabled=True), 0, NOW)
+    assert d.action is Action.ESCALATE
+
+
+def test_decide_new_failure_after_ready_can_restore_again():
+    policy = Policy(1, 120, 1, restore_enabled=True)
+    mem, _ = observe(crashloop_view(), PodMemory(restarts=1, restored=True), NOW)
+    mem, _ = observe(pod_view(ready_pod(uid="u2")), mem, NOW)
+    assert mem.restored is False and mem.failing_since is None
+    mem, _ = observe(crashloop_view(uid="u3"), mem, NOW)
+    mem = replace(mem, restarts=1)
+    d = decide(crashloop_view(uid="u3"), mem, policy, 0, NOW)
+    assert d.action is Action.RESTORE
 
 
 def test_status_round_trip():

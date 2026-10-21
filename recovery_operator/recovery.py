@@ -7,6 +7,7 @@ from enum import Enum
 
 class Action(Enum):
     RESTART = "RESTART"
+    RESTORE = "RESTORE"
     ESCALATE = "ESCALATE"
     WAIT = "WAIT"
     SKIP = "SKIP"
@@ -19,6 +20,7 @@ class PodView:
     terminating: bool
     ready: bool
     crash_looping: bool
+    node_ready: bool = True
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,9 @@ class PodMemory:
     deleted_uid: str | None = None
     dry_run_uid: str | None = None
     escalated: bool = False
+    failing_since: datetime | None = None
+    restored: bool = False
+    restore_dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,7 @@ class Policy:
     max_restarts: int
     unready_seconds: int
     max_concurrent: int
+    restore_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -46,7 +52,7 @@ class Decision:
     reason: str
 
 
-def pod_view(pod: dict) -> PodView:
+def pod_view(pod: dict, node_ready: bool = True) -> PodView:
     """Return the fields the recovery logic needs from a pod dict."""
     meta = pod.get("metadata", {})
     status = pod.get("status") or {}
@@ -64,6 +70,7 @@ def pod_view(pod: dict) -> PodView:
         terminating=meta.get("deletionTimestamp") is not None,
         ready=ready,
         crash_looping=crash_looping,
+        node_ready=node_ready,
     )
 
 
@@ -73,11 +80,26 @@ def observe(pod: PodView, mem: PodMemory, now: datetime) -> tuple[PodMemory, boo
     if mem.uid != pod.uid:
         mem = replace(mem, unready_since=None, dry_run_uid=None)
     if pod.ready:
-        if mem.deleted_uid or mem.restarts or mem.escalated:
+        if mem.deleted_uid or mem.restarts or mem.escalated or mem.restored:
             recovered = True
-        mem = replace(mem, unready_since=None, deleted_uid=None, restarts=0, escalated=False)
-    elif mem.unready_since is None:
-        mem = replace(mem, unready_since=now)
+        mem = replace(
+            mem,
+            unready_since=None,
+            deleted_uid=None,
+            restarts=0,
+            escalated=False,
+            failing_since=None,
+            restored=False,
+            restore_dry_run=False,
+        )
+    elif pod.node_ready:
+        if mem.unready_since is None:
+            mem = replace(mem, unready_since=now)
+        if mem.failing_since is None:
+            mem = replace(mem, failing_since=now)
+    else:
+        # node outage: do not count unready time, fencing owns the failure
+        mem = replace(mem, unready_since=None)
     return replace(mem, uid=pod.uid), recovered
 
 
@@ -89,6 +111,8 @@ def decide(
         return Decision(Action.SKIP, "already recovering")
     if pod.ready:
         return Decision(Action.SKIP, "healthy")
+    if not pod.node_ready:
+        return Decision(Action.WAIT, "node unhealthy, left to fencing")
     if pod.crash_looping:
         reason = "CrashLoopBackOff"
     else:
@@ -97,6 +121,8 @@ def decide(
             return Decision(Action.WAIT, f"unready for {int(unready_for)}s")
         reason = f"unready for {int(unready_for)}s"
     if mem.restarts >= policy.max_restarts:
+        if policy.restore_enabled and not mem.restored:
+            return Decision(Action.RESTORE, reason)
         return Decision(Action.ESCALATE, reason)
     if in_flight_others >= policy.max_concurrent:
         return Decision(Action.WAIT, "concurrency cap reached")
@@ -112,6 +138,9 @@ def to_status(mem: PodMemory) -> dict:
         "deletedUid": mem.deleted_uid,
         "dryRunUid": mem.dry_run_uid,
         "escalated": mem.escalated,
+        "failingSince": mem.failing_since.isoformat() if mem.failing_since else None,
+        "restored": mem.restored or None,
+        "restoreDryRun": mem.restore_dry_run or None,
     }
     return {k: v for k, v in out.items() if v is not None}
 
@@ -127,6 +156,11 @@ def from_status(d: dict | None) -> PodMemory:
         deleted_uid=d.get("deletedUid"),
         dry_run_uid=d.get("dryRunUid"),
         escalated=d.get("escalated", False),
+        failing_since=(
+            datetime.fromisoformat(d["failingSince"]) if d.get("failingSince") else None
+        ),
+        restored=d.get("restored", False),
+        restore_dry_run=d.get("restoreDryRun", False),
     )
 
 
