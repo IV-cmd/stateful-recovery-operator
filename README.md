@@ -22,7 +22,8 @@ This is a learning project. The owner writes all implementation code.
 
 1. Run `make cluster` to create the kind cluster.
 2. Run `make csi` to install the CSI snapshot lab.
-3. Run `make deploy` to apply the manifests in `deploy/`.
+3. Run `make nfs` to install the NFS driver and server. It provides cross-node volumes for the M4 fencing test.
+4. Run `make deploy` to apply the manifests in `deploy/`.
 
 ## Architecture
 
