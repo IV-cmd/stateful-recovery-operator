@@ -69,5 +69,20 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
         else:
             logger.info(f"{snap_name} already exists, skipping")
 
+    retention = spec.get("backup", {}).get("retention")
+    if retention:
+        for pvc in backup.pvc_names(sts):
+            ready = [
+                s for s in backup.list_snapshots(namespace, name, pvc)
+                if not backup.is_pending(s)
+            ]
+            for snap_name in backup.snapshots_to_prune(ready, retention):
+                try:
+                    backup.delete_snapshot(namespace, snap_name)
+                except ApiException as e:
+                    kopf.warn(body, reason="PruneFailed", message=f"{snap_name}: {e.reason}")
+                    continue
+                kopf.info(body, reason="BackupPruned", message=snap_name)
+
     patch.status["lastBackupTime"] = slot.isoformat()
     patch.status["phase"] = "Ready"
