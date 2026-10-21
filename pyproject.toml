@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Kopf operator that backs up and recovers StatefulSets with CSI VolumeSnapshots"
 requires-python = ">=3.11"
 dependencies = [
+    "croniter",
     "kopf",
     "kubernetes",
     "prometheus_client",
