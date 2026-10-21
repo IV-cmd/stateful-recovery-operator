@@ -191,3 +191,183 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
             rec_status["lastAction"] = last_action
             rec_status["lastActionTime"] = now.isoformat()
         patch.status["recovery"] = rec_status
+
+
+def _node_view(node: dict, fenced_by: str) -> recovery.NodeView:
+    meta = node["metadata"]
+    status = node.get("status") or {}
+    ready: dict = next(
+        (c for c in status.get("conditions") or [] if c.get("type") == "Ready"), {}
+    )
+    taints = (node.get("spec") or {}).get("taints") or []
+    labels = meta.get("labels") or {}
+    annotations = meta.get("annotations") or {}
+    return recovery.NodeView(
+        name=meta["name"],
+        uid=meta["uid"],
+        ready=ready.get("status") == "True",
+        ready_since_transition=(
+            datetime.fromisoformat(ready["lastTransitionTime"])
+            if ready.get("lastTransitionTime")
+            else None
+        ),
+        unreachable_taint=any(t.get("key") == "node.kubernetes.io/unreachable" for t in taints),
+        oos_taint=any(t.get("key") == k8s.OOS_TAINT_KEY for t in taints),
+        fenced_by_us=annotations.get(k8s.FENCED_BY_KEY) == fenced_by,
+        control_plane="node-role.kubernetes.io/control-plane" in labels,
+    )
+
+
+def _any_attach_required(target_pvcs: set) -> bool:
+    """Return True if any target PVC's PV driver requires VolumeAttachments."""
+    drivers = set()
+    for pv in k8s.list_persistent_volumes():
+        claim = ((pv.get("spec") or {}).get("claimRef") or {}).get("name")
+        driver = ((pv.get("spec") or {}).get("csi") or {}).get("driver")
+        if claim in target_pvcs and driver:
+            drivers.add(driver)
+    for driver in drivers:
+        try:
+            csi = client.StorageV1Api().read_csi_driver(driver)
+        except ApiException:
+            continue
+        if csi.spec.attach_required:
+            return True
+    return False
+
+
+@kopf.timer(*RESOURCE, interval=10, initial_delay=5)
+def fencing_timer(spec, status, name, namespace, body, patch, logger, **_):
+    rspec = spec.get("recovery") or {}
+    fspec = rspec.get("fencing") or {}
+    policy = recovery.FencePolicy(
+        enabled=fspec.get("enabled", False),
+        dry_run=rspec.get("dryRun", True),
+        not_ready_seconds=fspec.get("notReadySeconds", 120),
+        verify_seconds=fspec.get("verifySeconds", 180),
+    )
+
+    sts_name = spec["targetRef"]["name"]
+    try:
+        sts = client.AppsV1Api().read_namespaced_stateful_set(sts_name, namespace)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        return
+    sts = ApiClient().sanitize_for_serialization(sts)
+    labels = sts.get("spec", {}).get("selector", {}).get("matchLabels") or {}
+    selector = ",".join(f"{k}={v}" for k, v in labels.items())
+    pods = client.CoreV1Api().list_namespaced_pod(namespace, label_selector=selector)
+    pods = [
+        ApiClient().sanitize_for_serialization(p)
+        for p in pods.items
+        if any(
+            o.kind == "StatefulSet" and o.name == sts_name
+            for o in (p.metadata.owner_references or [])
+        )
+    ]
+    target_pvcs = set(backup.pvc_names(sts))
+
+    stored = (status.get("recovery") or {}).get("fencing") or {}
+    mems = {n: recovery.fence_from_status(d) for n, d in stored.items()}
+    fenced_by = f"{namespace}/{name}"
+    now = datetime.now(UTC)
+
+    node_names = set()
+    for p in pods:
+        if (p.get("spec") or {}).get("nodeName"):
+            node_names.add(p["spec"]["nodeName"])
+    node_names |= set(stored)
+    if not node_names:
+        return
+
+    all_nodes = {n["metadata"]["name"]: n for n in k8s.list_nodes()}
+    unhealthy = {
+        n["metadata"]["name"]
+        for n in all_nodes.values()
+        if next(
+            (c for c in (n.get("status") or {}).get("conditions") or [] if c.get("type") == "Ready"),
+            {},
+        ).get("status") != "True"
+    }
+    pv_to_pvc = {
+        pv["metadata"]["name"]: ((pv.get("spec") or {}).get("claimRef") or {}).get("name")
+        for pv in k8s.list_persistent_volumes()
+    }
+    attachments = [
+        a
+        for a in k8s.list_volume_attachments()
+        if pv_to_pvc.get((a.get("spec") or {}).get("source", {}).get("persistentVolumeName"))
+        in target_pvcs
+    ]
+
+    desired: dict[str, dict | None] = {}
+    for node_name in node_names:
+        node = all_nodes.get(node_name)
+        if node is None:
+            desired[node_name] = None
+            continue
+        view = _node_view(node, fenced_by)
+        on_node = [
+            p for p in pods if (p.get("spec") or {}).get("nodeName") == node_name
+        ]
+        left = sum(
+            1 for a in attachments if (a.get("spec") or {}).get("nodeName") == node_name
+        )
+        sit = recovery.NodeSituation(
+            target_pods_on_node=len(on_node),
+            target_pods_gone=len(on_node) == 0,
+            attachments_left=left,
+            other_unhealthy_nodes=len(unhealthy - {node_name}),
+        )
+        mem = mems.get(node_name, recovery.FenceMemory())
+        mem, d = recovery.decide_node(view, mem, sit, policy, now)
+
+        if d.action is recovery.NodeAction.FENCE:
+            k8s.fence_node(node_name, fenced_by)
+            mem = replace(mem, state="Fenced")
+            kopf.info(body, reason="NodeFenced", message=f"{node_name}: {d.reason}")
+        elif d.action is recovery.NodeAction.DRY_RUN:
+            kopf.info(
+                body,
+                reason="NodeFenceDryRun",
+                message=f"would taint {node_name} out-of-service",
+            )
+        elif d.action is recovery.NodeAction.VERIFY_OK:
+            seconds = (
+                int((now - mem.fenced_at).total_seconds()) if mem.fenced_at else 0
+            )
+            note = (
+                "attachments cleared"
+                if _any_attach_required(target_pvcs)
+                else "no VolumeAttachment required"
+            )
+            kopf.info(
+                body,
+                reason="FenceVerified",
+                message=f"{node_name}: verified after {seconds}s, {note}",
+            )
+        elif d.action is recovery.NodeAction.VERIFY_TIMEOUT:
+            kopf.warn(body, reason="FenceUnverified", message=f"{node_name}: {d.reason}")
+        elif d.action is recovery.NodeAction.REFUSE:
+            kopf.warn(body, reason="FenceRefused", message=f"{node_name}: {d.reason}")
+        elif d.action is recovery.NodeAction.UNFENCE:
+            k8s.unfence_node(node_name)
+            kopf.info(body, reason="NodeUnfenced", message=f"{node_name}: taint removed")
+        else:
+            logger.debug(f"{name}/{node_name}: {d.action.value} {d.reason}")
+
+        desired[node_name] = recovery.fence_to_status(mem)
+
+    for n in stored:
+        if n not in desired:
+            desired[n] = None
+    for n, entry in desired.items():
+        if entry is not None and n in stored:
+            for k in stored[n]:
+                entry.setdefault(k, None)
+
+    if desired != stored:
+        rec_status = dict(status.get("recovery") or {})
+        rec_status["fencing"] = desired
+        patch.status["recovery"] = rec_status

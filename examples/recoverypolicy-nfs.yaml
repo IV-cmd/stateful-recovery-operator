@@ -1,0 +1,12 @@
+apiVersion: recovery.iv-cmd.dev/v1alpha1
+kind: RecoveryPolicy
+metadata:
+  name: pg-nfs
+spec:
+  targetRef:
+    name: pg-nfs
+  recovery:
+    dryRun: true
+    fencing:
+      enabled: true
+      notReadySeconds: 60

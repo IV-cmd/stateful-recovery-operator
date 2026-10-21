@@ -76,6 +76,24 @@ spec:
                       type: integer
                       minimum: 1
                       default: 120
+                    fencing:
+                      type: object
+                      # default {} so the field defaults apply even when fencing is omitted.
+                      default: {}
+                      properties:
+                        enabled:
+                          description: Fence dead nodes with the out-of-service taint.
+                          type: boolean
+                          default: false
+                        notReadySeconds:
+                          description: How long a node must stay NotReady before fencing.
+                          type: integer
+                          minimum: 60
+                          default: 120
+                        verifySeconds:
+                          description: How long to wait for pods and VolumeAttachments to clear before warning.
+                          type: integer
+                          default: 180
                     dryRun:
                       description: Log recovery actions without executing them.
                       type: boolean
