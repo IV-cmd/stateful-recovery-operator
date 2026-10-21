@@ -1,8 +1,11 @@
 """CSI VolumeSnapshot scheduling and lifecycle for StatefulSet PVCs."""
 
 from datetime import datetime, timedelta
+from typing import Any, cast
 
 from croniter import croniter
+from kubernetes import client
+from kubernetes.client.exceptions import ApiException
 
 SNAPSHOT_GROUP, SNAPSHOT_VERSION, SNAPSHOT_PLURAL = (
     "snapshot.storage.k8s.io",
@@ -76,3 +79,39 @@ def snapshots_to_prune(snaps: list[dict], retention: int) -> list[str]:
         key=lambda s: (s["metadata"]["creationTimestamp"], s["metadata"]["name"]),
     )
     return [s["metadata"]["name"] for s in ordered[: max(len(ordered) - retention, 0)]]
+
+
+def list_snapshots(namespace: str, policy: str, pvc: str | None = None) -> list[dict]:
+    """List this policy's VolumeSnapshots, optionally for one PVC."""
+    selector = f"{POLICY_LABEL}={policy}"
+    if pvc is not None:
+        selector += f",{PVC_LABEL}={pvc}"
+    result = client.CustomObjectsApi().list_namespaced_custom_object(
+        SNAPSHOT_GROUP, SNAPSHOT_VERSION, namespace, SNAPSHOT_PLURAL,
+        label_selector=selector,
+    )
+    return cast(dict[str, Any], result)["items"]
+
+
+def create_snapshot(namespace: str, body: dict) -> bool:
+    """Create a VolumeSnapshot. Return False when the name already exists."""
+    try:
+        client.CustomObjectsApi().create_namespaced_custom_object(
+            SNAPSHOT_GROUP, SNAPSHOT_VERSION, namespace, SNAPSHOT_PLURAL, body,
+        )
+        return True
+    except ApiException as e:
+        if e.status == 409:
+            return False
+        raise
+
+
+def delete_snapshot(namespace: str, name: str) -> None:
+    """Delete a VolumeSnapshot, ignoring a missing one."""
+    try:
+        client.CustomObjectsApi().delete_namespaced_custom_object(
+            SNAPSHOT_GROUP, SNAPSHOT_VERSION, namespace, SNAPSHOT_PLURAL, name,
+        )
+    except ApiException as e:
+        if e.status != 404:
+            raise
