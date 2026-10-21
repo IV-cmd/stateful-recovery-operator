@@ -7,6 +7,7 @@ import kopf
 from kubernetes import client
 from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
+from kubernetes.utils import parse_quantity
 
 from . import backup, k8s, recovery
 
@@ -300,7 +301,9 @@ def _restore_drive(
     apps = client.AppsV1Api()
     custom = client.CustomObjectsApi()
     state = recovery.restore_from_status(rec["restore"])
-    bind_timeout = (rspec.get("restore") or {}).get("bindTimeoutSeconds", 180)
+    restorespec = rspec.get("restore") or {}
+    bind_timeout = restorespec.get("bindTimeoutSeconds", 180)
+    ready_timeout = restorespec.get("readyTimeoutSeconds", 300)
 
     def read_pvc(n):
         try:
@@ -329,8 +332,8 @@ def _restore_drive(
             snap_size = (sel.get("status") or {}).get("restoreSize")
             sel_size = (
                 snap_size
-                if recovery.quantity_bytes(snap_size)
-                >= recovery.quantity_bytes(template_size)
+                if parse_quantity(snap_size or "0")
+                >= parse_quantity(template_size or "0")
                 else template_size
             )
 
@@ -369,6 +372,7 @@ def _restore_drive(
     obs = recovery.RestoreObservation(
         selected_snapshot=sel_name,
         selected_size=sel_size,
+        sts_replicas=(sts.get("spec") or {}).get("replicas", 1),
         snapshot_exists=snap_exists,
         snapshot_ready=snap_ready,
         check_pvc_phase=(check.get("status") or {}).get("phase") if check else None,
@@ -379,7 +383,9 @@ def _restore_drive(
         pod_ready=pod_ready,
     )
     prev = state.state
-    state, d = recovery.restore_step(state, obs, now, bind_timeout)
+    state, d = recovery.restore_step(
+        state, obs, now, bind_timeout, ready_timeout
+    )
 
     if state.state != prev and d.op not in (
         recovery.RestoreOp.FAIL,
@@ -406,10 +412,6 @@ def _restore_drive(
             if e.status != 404:
                 raise
     elif d.op is recovery.RestoreOp.SCALE_DOWN:
-        if state.original_replicas is None:
-            state = replace(
-                state, original_replicas=(sts.get("spec") or {}).get("replicas", 1)
-            )
         apps.patch_namespaced_stateful_set(
             sts["metadata"]["name"], namespace, {"spec": {"replicas": 0}}
         )
@@ -460,6 +462,14 @@ def _restore_drive(
         patch.status["lastRestoreTime"] = now.isoformat()
         patch.status["lastRestoreSnapshot"] = state.snapshot
     elif d.op is recovery.RestoreOp.FAIL:
+        # a failure from any state cleans up the validation PVC
+        try:
+            core.delete_namespaced_persistent_volume_claim(
+                f"{state.pvc}-restore-check", namespace
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
         kopf.warn(
             body,
             reason="RestoreFailed",

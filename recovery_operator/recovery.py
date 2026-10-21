@@ -374,6 +374,7 @@ class RestoreObservation:
 
     selected_snapshot: str | None = None
     selected_size: str | None = None
+    sts_replicas: int = 1
     snapshot_exists: bool = True
     snapshot_ready: bool = True
     check_pvc_phase: str | None = None
@@ -399,13 +400,15 @@ def restore_step(
     obs: RestoreObservation,
     now: datetime,
     bind_timeout: int,
+    ready_timeout: int,
 ) -> tuple[RestoreState, RestoreDecision]:
     """Advance the restore one step. Every decision re-checks reality, so a
     restart at any point resumes."""
-    expired = (
-        state.step_started_at is not None
-        and (now - state.step_started_at).total_seconds() > bind_timeout
-    )
+    def expired(timeout: int) -> bool:
+        return (
+            state.step_started_at is not None
+            and (now - state.step_started_at).total_seconds() > timeout
+        )
 
     def fail(reason: str) -> tuple[RestoreState, RestoreDecision]:
         return _restore_to(state, "RestoreFailed", now), RestoreDecision(
@@ -416,7 +419,12 @@ def restore_step(
         if not obs.selected_snapshot:
             return fail("no restorable snapshot")
         return _restore_to(
-            replace(state, snapshot=obs.selected_snapshot, size=obs.selected_size),
+            replace(
+                state,
+                snapshot=obs.selected_snapshot,
+                size=obs.selected_size,
+                original_replicas=obs.sts_replicas,
+            ),
             "Validating",
             now,
         ), RestoreDecision(RestoreOp.CHECK_PVC_CREATE, "snapshot selected")
@@ -428,12 +436,12 @@ def restore_step(
             return _restore_to(state, "ScalingDown", now), RestoreDecision(
                 RestoreOp.CHECK_PVC_DELETE, "check PVC bound, deleting it"
             )
+        if expired(bind_timeout):
+            return fail(f"check PVC not Bound after {bind_timeout}s")
         if obs.check_pvc_phase is None:
             return state, RestoreDecision(
                 RestoreOp.CHECK_PVC_CREATE, "proving the snapshot restores"
             )
-        if expired:
-            return fail(f"check PVC not Bound after {bind_timeout}s")
         return state, RestoreDecision(RestoreOp.WAIT, "check PVC binding")
 
     if state.state == "ScalingDown":
@@ -466,7 +474,7 @@ def restore_step(
             return state, RestoreDecision(
                 RestoreOp.PVC_CREATE, "creating PVC from snapshot"
             )
-        if expired:
+        if expired(bind_timeout):
             # leave the StatefulSet at 0: scaling up would provision an empty PVC
             return fail(f"PVC not Bound after {bind_timeout}s")
         return state, RestoreDecision(RestoreOp.WAIT, "PVC binding")
@@ -476,6 +484,8 @@ def restore_step(
             return _restore_to(state, "Restored", now), RestoreDecision(
                 RestoreOp.COMPLETE, "pod is Ready"
             )
+        if expired(ready_timeout):
+            return fail(f"restored pod not Ready after {ready_timeout}s")
         return state, RestoreDecision(RestoreOp.SCALE_UP, "waiting for pod")
 
     if state.state == "Restored":
@@ -484,32 +494,6 @@ def restore_step(
         )
 
     return state, RestoreDecision(RestoreOp.WAIT, f"state {state.state}")
-
-
-def quantity_bytes(q: str | None) -> int:
-    """Parse a k8s resource quantity into bytes. Unknown formats return 0."""
-    if not q:
-        return 0
-    units = {
-        "Ki": 2**10,
-        "Mi": 2**20,
-        "Gi": 2**30,
-        "Ti": 2**40,
-        "k": 10**3,
-        "M": 10**6,
-        "G": 10**9,
-        "T": 10**12,
-    }
-    for suffix, mult in units.items():
-        if q.endswith(suffix):
-            try:
-                return int(float(q[: -len(suffix)]) * mult)
-            except ValueError:
-                return 0
-    try:
-        return int(float(q))
-    except ValueError:
-        return 0
 
 
 def restore_to_status(state: RestoreState) -> dict:

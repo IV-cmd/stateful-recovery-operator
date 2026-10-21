@@ -6,7 +6,6 @@ from recovery_operator.recovery import (
     RestoreObservation,
     RestoreOp,
     RestoreState,
-    quantity_bytes,
     restore_from_status,
     restore_step,
     restore_to_status,
@@ -14,20 +13,22 @@ from recovery_operator.recovery import (
 
 NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 TIMEOUT = 180
+READY_TIMEOUT = 300
 
 
 def obs(**kw):
     return RestoreObservation(**kw)
 
 
-def step(state, observation, now=NOW, timeout=TIMEOUT):
-    return restore_step(state, observation, now, timeout)
+def step(state, observation, now=NOW, timeout=TIMEOUT, ready=READY_TIMEOUT):
+    return restore_step(state, observation, now, timeout, ready)
 
 
 def test_selected_picks_snapshot():
     s = RestoreState(state="Selected", pvc="data-postgres-0", pod="postgres-0")
-    s, d = step(s, obs(selected_snapshot="snap-1", selected_size="1Gi"))
+    s, d = step(s, obs(selected_snapshot="snap-1", selected_size="1Gi", sts_replicas=3))
     assert s.state == "Validating" and s.snapshot == "snap-1" and s.size == "1Gi"
+    assert s.original_replicas == 3
     assert d.op is RestoreOp.CHECK_PVC_CREATE
 
 
@@ -41,6 +42,16 @@ def test_validating_creates_check_when_absent():
     s = RestoreState(state="Validating", snapshot="s", step_started_at=NOW)
     s, d = step(s, obs(check_pvc_phase=None))
     assert s.state == "Validating" and d.op is RestoreOp.CHECK_PVC_CREATE
+
+
+def test_validating_never_created_and_expired_fails():
+    s = RestoreState(
+        state="Validating",
+        snapshot="s",
+        step_started_at=NOW - timedelta(seconds=200),
+    )
+    s, d = step(s, obs(check_pvc_phase=None), NOW)
+    assert s.state == "RestoreFailed" and d.op is RestoreOp.FAIL
 
 
 def test_validating_waits_while_pending_then_advances():
@@ -77,6 +88,15 @@ def test_scaling_down_waits_for_pods():
     assert s2.state == "ScalingDown" and d.op is RestoreOp.SCALE_DOWN
     s2, d = step(s, obs(target_pods=0), NOW)
     assert s2.state == "RetainingOldPv" and d.op is RestoreOp.RETAIN_PV
+
+
+def test_scaling_down_resume_keeps_earlier_replicas():
+    # captured on the Selected transition; a crash mid-scale-down cannot turn it into 0
+    s = RestoreState(
+        state="ScalingDown", original_replicas=3, step_started_at=NOW
+    )
+    s2, _ = step(s, obs(target_pods=1, sts_replicas=0), NOW)
+    assert s2.original_replicas == 3
 
 
 def test_retaining_old_pv_resumes():
@@ -122,18 +142,21 @@ def test_scaling_up_waits_for_pod():
     assert s2.state == "Restored" and d.op is RestoreOp.COMPLETE
 
 
+def test_scaling_up_timeout_fails():
+    s = RestoreState(
+        state="ScalingUp",
+        step_started_at=NOW - timedelta(seconds=301),
+        original_replicas=1,
+    )
+    s, d = step(s, obs(pod_ready=False), NOW)
+    assert s.state == "RestoreFailed" and d.op is RestoreOp.FAIL
+    assert "not Ready after 300s" in d.reason
+
+
 def test_restored_clears_next_tick():
     s = RestoreState(state="Restored", step_started_at=NOW)
     s, d = step(s, obs(), NOW)
     assert s.state == "Done" and d.op is RestoreOp.CLEAR
-
-
-def test_quantity_bytes():
-    assert quantity_bytes("1Gi") == 2**30
-    assert quantity_bytes("512Mi") == 512 * 2**20
-    assert quantity_bytes("1G") == 10**9
-    assert quantity_bytes("1024") == 1024
-    assert quantity_bytes(None) == quantity_bytes("junk") == 0
 
 
 def test_restore_status_round_trip():

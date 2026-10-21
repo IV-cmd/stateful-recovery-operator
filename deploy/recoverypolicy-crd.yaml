@@ -108,6 +108,11 @@ spec:
                           type: integer
                           minimum: 30
                           default: 180
+                        readyTimeoutSeconds:
+                          description: How long to wait for the restored pod to become Ready before giving up.
+                          type: integer
+                          minimum: 60
+                          default: 300
                     dryRun:
                       description: Log recovery actions without executing them.
                       type: boolean

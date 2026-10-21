@@ -25,6 +25,20 @@ This is a learning project. The owner writes all implementation code.
 3. Run `make nfs` to install the NFS driver and server. It provides cross-node volumes for the M4 fencing test.
 4. Run `make deploy` to apply the manifests in `deploy/`.
 
+## After RestoreFailed
+
+The operator does not retry a failed restore. Inspect these items before you reset:
+
+- The snapshot named in the `RestoreFailed` event and in `status.recovery.restore.snapshot`.
+- The retained old PV, if any. Its name is in `status.recovery.restore.oldPv` and it carries the annotation `recovery.iv-cmd.dev/retained-from`. It keeps the pre-restore data.
+- The StatefulSet replica count. A failure in `CreatingPvc` leaves it at 0 by design.
+
+To clear the failed state and let the operator try again:
+
+```sh
+kubectl patch rp <name> --subresource=status --type=merge -p '{"status":{"phase":"Ready","recovery":{"restore":null}}}'
+```
+
 ## Architecture
 
 TODO: document the controller flow once M1 lands.
