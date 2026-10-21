@@ -72,6 +72,30 @@ def is_pending(snap: dict) -> bool:
     return not status.get("readyToUse") and not status.get("error")
 
 
+def latest_restorable(
+    snaps: list[dict], policy: str, pvc: str, before: datetime
+) -> dict | None:
+    """Return the newest ready snapshot for this PVC taken before the failure.
+
+    A snapshot taken after the failure began may contain the corruption.
+    """
+    candidates = [
+        s
+        for s in snaps
+        if (s["metadata"].get("labels") or {}).get(POLICY_LABEL) == policy
+        and (s["metadata"].get("labels") or {}).get(PVC_LABEL) == pvc
+        and (s.get("status") or {}).get("readyToUse") is True
+        and not (s.get("status") or {}).get("error")
+        and datetime.fromisoformat(s["metadata"]["creationTimestamp"]) < before
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda s: (s["metadata"]["creationTimestamp"], s["metadata"]["name"]),
+    )
+
+
 def snapshots_to_prune(snaps: list[dict], retention: int) -> list[str]:
     """Return the names of all but the newest retention snapshots."""
     ordered = sorted(

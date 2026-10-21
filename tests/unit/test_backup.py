@@ -6,6 +6,7 @@ from recovery_operator.backup import (
     current_slot,
     is_due,
     is_pending,
+    latest_restorable,
     pvc_names,
     snapshot_name,
     snapshots_to_prune,
@@ -79,3 +80,62 @@ def test_snapshots_to_prune():
 def test_snapshots_to_prune_tie_broken_by_name():
     snaps = [snap("z", "2026-01-01T14:30:00Z"), snap("a", "2026-01-01T14:30:00Z")]
     assert snapshots_to_prune(snaps, 1) == ["a"]
+
+
+def vsnap(name, ts, labels=None, ready=True, error=None):
+    return {
+        "metadata": {
+            "name": name,
+            "creationTimestamp": ts.isoformat(),
+            "labels": labels
+            or {"recovery.iv-cmd.dev/policy": "postgres", "recovery.iv-cmd.dev/pvc": "data-postgres-0"},
+        },
+        "status": {"readyToUse": ready, "error": error},
+    }
+
+
+def test_latest_restorable_picks_newest_before_failure():
+    before = utc(14, 30)
+    snaps = [
+        vsnap("s1", utc(14, 0)),
+        vsnap("s2", utc(14, 10)),
+        vsnap("s3", utc(14, 40)),  # after the failure began
+    ]
+    chosen = latest_restorable(snaps, "postgres", "data-postgres-0", before)
+    assert chosen["metadata"]["name"] == "s2"
+
+
+def test_latest_restorable_filters():
+    before = utc(14, 30)
+    assert (
+        latest_restorable(
+            [
+                vsnap(
+                    "wrong-policy",
+                    utc(14, 0),
+                    labels={
+                        "recovery.iv-cmd.dev/policy": "other",
+                        "recovery.iv-cmd.dev/pvc": "data-postgres-0",
+                    },
+                ),
+                vsnap(
+                    "wrong-pvc",
+                    utc(14, 0),
+                    labels={
+                        "recovery.iv-cmd.dev/policy": "postgres",
+                        "recovery.iv-cmd.dev/pvc": "data-postgres-1",
+                    },
+                ),
+                vsnap("not-ready", utc(14, 0), ready=False),
+                vsnap("errored", utc(14, 0), error={"message": "x"}),
+            ],
+            "postgres",
+            "data-postgres-0",
+            before,
+        )
+        is None
+    )
+
+
+def test_latest_restorable_empty():
+    assert latest_restorable([], "postgres", "data-postgres-0", utc(14, 30)) is None

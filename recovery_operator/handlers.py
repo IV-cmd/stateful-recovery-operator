@@ -58,6 +58,15 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
         return
     sts = ApiClient().sanitize_for_serialization(sts)
 
+    rec = status.get("recovery") or {}
+    unhealthy = rec.get("restore") or any(
+        (p or {}).get("failingSince") for p in (rec.get("pods") or {}).values()
+    )
+    if unhealthy:
+        # never snapshot a possibly corrupted workload
+        kopf.info(body, reason="BackupSkipped", message="workload unhealthy")
+        return
+
     if any(backup.is_pending(s) for s in backup.list_snapshots(namespace, name)):
         logger.info(f"{name}: a snapshot is still pending, skipping this tick")
         kopf.info(body, reason="BackupSkipped", message="a snapshot is still pending")
