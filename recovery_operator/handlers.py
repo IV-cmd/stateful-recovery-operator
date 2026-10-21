@@ -1,5 +1,6 @@
 """Kopf handlers that watch RecoveryPolicy objects and drive backup and recovery."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import kopf
@@ -7,7 +8,7 @@ from kubernetes import client
 from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
 
-from . import backup, k8s
+from . import backup, k8s, recovery
 
 RESOURCE = ("recovery.iv-cmd.dev", "v1alpha1", "recoverypolicies")
 
@@ -85,4 +86,108 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
                 kopf.info(body, reason="BackupPruned", message=snap_name)
 
     patch.status["lastBackupTime"] = slot.isoformat()
-    patch.status["phase"] = "Ready"
+    if status.get("phase") != "Failed":
+        patch.status["phase"] = "Ready"
+
+
+@kopf.timer(*RESOURCE, interval=10, initial_delay=5)
+def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
+    sts_name = spec["targetRef"]["name"]
+    try:
+        sts_obj = client.AppsV1Api().read_namespaced_stateful_set(sts_name, namespace)
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        return
+    labels = sts_obj.spec.selector.match_labels or {}
+    selector = ",".join(f"{k}={v}" for k, v in labels.items())
+    pods = client.CoreV1Api().list_namespaced_pod(namespace, label_selector=selector)
+    pods = [
+        ApiClient().sanitize_for_serialization(p)
+        for p in pods.items
+        if any(
+            o.kind == "StatefulSet" and o.name == sts_name
+            for o in (p.metadata.owner_references or [])
+        )
+    ]
+
+    rec = status.get("recovery") or {}
+    stored = rec.get("pods") or {}
+    mems = {n: recovery.from_status(d) for n, d in stored.items()}
+    rspec = spec.get("recovery") or {}
+    policy = recovery.Policy(
+        rspec.get("maxRestarts", 3),
+        rspec.get("unreadySeconds", 120),
+        rspec.get("maxConcurrentRecoveries", 1),
+    )
+    dry_run = rspec.get("dryRun", True)
+    now = datetime.now(UTC)
+
+    desired: dict[str, dict | None] = {}
+    last_action = None
+    recovered_any = False
+    for pod in pods:
+        pname = pod["metadata"]["name"]
+        view = recovery.pod_view(pod)
+        mem, recovered = recovery.observe(
+            view, mems.get(pname, recovery.PodMemory()), now
+        )
+        if recovered:
+            recovered_any = True
+            kopf.info(body, reason="RecoveryCompleted", message=f"{pname} is Ready")
+        in_flight = sum(
+            1 for n, m in mems.items() if n != pname and m.deleted_uid
+        )
+        d = recovery.decide(view, mem, policy, in_flight, now)
+        if d.action is recovery.Action.RESTART:
+            if dry_run:
+                if mem.dry_run_uid != view.uid:
+                    kopf.info(
+                        body,
+                        reason="RecoveryDryRun",
+                        message=f"would delete {pname}: {d.reason}",
+                    )
+                    mem = replace(mem, dry_run_uid=view.uid)
+            else:
+                try:
+                    client.CoreV1Api().delete_namespaced_pod(pname, namespace)
+                except ApiException as e:
+                    if e.status != 404:
+                        raise
+                kopf.info(
+                    body,
+                    reason="RecoveryStarted",
+                    message=f"deleted {pname}: {d.reason}",
+                )
+                mem = replace(mem, deleted_uid=view.uid, restarts=mem.restarts + 1)
+                last_action = f"RESTART {pname}: {d.reason}"
+        elif d.action is recovery.Action.ESCALATE:
+            if not mem.escalated:
+                kopf.warn(body, reason="RecoveryEscalated", message=f"{pname}: {d.reason}")
+                mem = replace(mem, escalated=True)
+                patch.status["phase"] = "Failed"
+                last_action = f"ESCALATE {pname}: {d.reason}"
+        else:
+            logger.debug(f"{name}/{pname}: {d.action.value} {d.reason}")
+        mems[pname] = mem
+        desired[pname] = recovery.to_status(mem)
+
+    if recovered_any and not any(m.escalated for m in mems.values()):
+        patch.status["phase"] = "Ready"
+
+    # pods that no longer exist are cleared by the merge patch's null value
+    for n in stored:
+        if n not in desired:
+            desired[n] = None
+    # the merge patch merges pod entries, so cleared fields need explicit nulls
+    for n, entry in desired.items():
+        if entry is not None and n in stored:
+            for k in stored[n]:
+                entry.setdefault(k, None)
+
+    if desired != stored or last_action is not None:
+        rec_status: dict = {"pods": desired}
+        if last_action is not None:
+            rec_status["lastAction"] = last_action
+            rec_status["lastActionTime"] = now.isoformat()
+        patch.status["recovery"] = rec_status

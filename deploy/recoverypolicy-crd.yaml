@@ -26,6 +26,9 @@ spec:
         - name: Last Backup
           type: date
           jsonPath: .status.lastBackupTime
+        - name: Last Recovery
+          type: date
+          jsonPath: .status.recovery.lastActionTime
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -63,6 +66,16 @@ spec:
                       type: integer
                       minimum: 1
                       default: 1
+                    maxRestarts:
+                      description: Consecutive restarts before the operator gives up and sets phase Failed.
+                      type: integer
+                      minimum: 0
+                      default: 3
+                    unreadySeconds:
+                      description: How long a pod must stay unready before a restart.
+                      type: integer
+                      minimum: 1
+                      default: 120
                     dryRun:
                       description: Log recovery actions without executing them.
                       type: boolean
