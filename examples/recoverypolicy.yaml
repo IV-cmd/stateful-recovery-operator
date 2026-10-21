@@ -10,3 +10,7 @@ spec:
     retention: 3
   recovery:
     dryRun: true
+    maxRestarts: 3
+    unreadySeconds: 120
+    restore:
+      enabled: false

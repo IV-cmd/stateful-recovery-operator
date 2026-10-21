@@ -108,6 +108,7 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
         if e.status != 404:
             raise
         return
+    sts = ApiClient().sanitize_for_serialization(sts_obj)
     labels = sts_obj.spec.selector.match_labels or {}
     selector = ",".join(f"{k}={v}" for k, v in labels.items())
     pods = client.CoreV1Api().list_namespaced_pod(namespace, label_selector=selector)
@@ -128,16 +129,42 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
         rspec.get("maxRestarts", 3),
         rspec.get("unreadySeconds", 120),
         rspec.get("maxConcurrentRecoveries", 1),
+        restore_enabled=(rspec.get("restore") or {}).get("enabled", False),
     )
     dry_run = rspec.get("dryRun", True)
     now = datetime.now(UTC)
 
+    # a restore in progress drives itself; M3 actions stay out of its way
+    if rec.get("restore"):
+        _restore_drive(
+            sts, pods, mems, stored, rec, name, namespace, body, patch, logger, now, rspec
+        )
+        return
+
+    ready_nodes = {
+        n["metadata"]["name"]
+        for n in k8s.list_nodes()
+        if next(
+            (
+                c
+                for c in (n.get("status") or {}).get("conditions") or []
+                if c.get("type") == "Ready"
+            ),
+            {},
+        ).get("status")
+        == "True"
+    }
+
     desired: dict[str, dict | None] = {}
     last_action = None
+    rec_status_restore = None
     recovered_any = False
     for pod in pods:
         pname = pod["metadata"]["name"]
-        view = recovery.pod_view(pod)
+        node_name = (pod.get("spec") or {}).get("nodeName")
+        view = recovery.pod_view(
+            pod, node_ready=node_name is None or node_name in ready_nodes
+        )
         mem, recovered = recovery.observe(
             view, mems.get(pname, recovery.PodMemory()), now
         )
@@ -170,6 +197,41 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
                 )
                 mem = replace(mem, deleted_uid=view.uid, restarts=mem.restarts + 1)
                 last_action = f"RESTART {pname}: {d.reason}"
+        elif d.action is recovery.Action.RESTORE:
+            pvc = _pvc_for_pod(sts, pname)
+            if dry_run:
+                if not mem.restore_dry_run:
+                    sel = backup.latest_restorable(
+                        backup.list_snapshots(namespace, name, pvc),
+                        name,
+                        pvc,
+                        mem.failing_since or now,
+                    )
+                    kopf.info(
+                        body,
+                        reason="RestoreDryRun",
+                        message=(
+                            f"would restore {pvc} for {pname} from "
+                            f"{sel['metadata']['name'] if sel else 'no snapshot found'} "
+                            "(validate, scale to 0, retain PV, recreate PVC, scale up)"
+                        ),
+                    )
+                    mem = replace(mem, restore_dry_run=True)
+            else:
+                state = recovery.RestoreState(
+                    state="Selected",
+                    pvc=pvc,
+                    pod=pname,
+                    started_at=now,
+                    step_started_at=now,
+                )
+                kopf.info(
+                    body,
+                    reason="RestoreStarted",
+                    message=f"{pname}: {d.reason}; restoring {pvc} from a snapshot",
+                )
+                last_action = f"RESTORE {pname}: {d.reason}"
+                rec_status_restore = recovery.restore_to_status(state)
         elif d.action is recovery.Action.ESCALATE:
             if not mem.escalated:
                 kopf.warn(body, reason="RecoveryEscalated", message=f"{pname}: {d.reason}")
@@ -194,12 +256,249 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
             for k in stored[n]:
                 entry.setdefault(k, None)
 
-    if desired != stored or last_action is not None:
+    if desired != stored or last_action is not None or rec_status_restore:
         rec_status: dict = {"pods": desired}
+        if rec_status_restore is not None:
+            rec_status["restore"] = rec_status_restore
         if last_action is not None:
             rec_status["lastAction"] = last_action
             rec_status["lastActionTime"] = now.isoformat()
         patch.status["recovery"] = rec_status
+
+
+def _pvc_for_pod(sts: dict, pod_name: str) -> str:
+    """Return the PVC name a pod's volumeClaimTemplate creates."""
+    templates = (sts.get("spec") or {}).get("volumeClaimTemplates") or []
+    return f"{templates[0]['metadata']['name']}-{pod_name}"
+
+
+def _pvc_body(sts: dict, name: str, size: str, snapshot: str, ns: str) -> dict:
+    """Build a PVC from the StatefulSet template, sourced from a snapshot."""
+    templates = (sts.get("spec") or {}).get("volumeClaimTemplates") or []
+    tmpl = templates[0].get("spec") or {}
+    return {
+        "metadata": {"name": name, "labels": dict(backup.MANAGED_BY)},
+        "spec": {
+            "storageClassName": tmpl.get("storageClassName"),
+            "accessModes": tmpl.get("accessModes"),
+            "resources": {"requests": {"storage": size}},
+            "dataSource": {
+                "name": snapshot,
+                "kind": "VolumeSnapshot",
+                "apiGroup": backup.SNAPSHOT_GROUP,
+            },
+        },
+    }
+
+
+def _restore_drive(
+    sts, pods, mems, stored, rec, name, namespace, body, patch, logger, now, rspec
+):
+    """Advance the in-progress restore one step per tick."""
+    core = client.CoreV1Api()
+    apps = client.AppsV1Api()
+    custom = client.CustomObjectsApi()
+    state = recovery.restore_from_status(rec["restore"])
+    bind_timeout = (rspec.get("restore") or {}).get("bindTimeoutSeconds", 180)
+
+    def read_pvc(n):
+        try:
+            return ApiClient().sanitize_for_serialization(
+                core.read_namespaced_persistent_volume_claim(n, namespace)
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            return None
+
+    sel_name, sel_size = None, None
+    if state.state == "Selected":
+        before = (mems.get(state.pod) or recovery.PodMemory()).failing_since or now
+        sel = backup.latest_restorable(
+            backup.list_snapshots(namespace, name, state.pvc), name, state.pvc, before
+        )
+        if sel:
+            sel_name = sel["metadata"]["name"]
+            templates = (sts.get("spec") or {}).get("volumeClaimTemplates") or []
+            template_size = (
+                ((templates[0].get("spec") or {}).get("resources") or {})
+                .get("requests", {})
+                .get("storage")
+            )
+            snap_size = (sel.get("status") or {}).get("restoreSize")
+            sel_size = (
+                snap_size
+                if recovery.quantity_bytes(snap_size)
+                >= recovery.quantity_bytes(template_size)
+                else template_size
+            )
+
+    snap_exists, snap_ready = True, True
+    if state.snapshot:
+        try:
+            snap = custom.get_namespaced_custom_object(
+                backup.SNAPSHOT_GROUP,
+                backup.SNAPSHOT_VERSION,
+                namespace,
+                backup.SNAPSHOT_PLURAL,
+                state.snapshot,
+            )
+            snap_ready = bool((snap.get("status") or {}).get("readyToUse"))
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            snap_exists = snap_ready = False
+
+    check = read_pvc(f"{state.pvc}-restore-check") if state.pvc else None
+    pvc = read_pvc(state.pvc) if state.pvc else None
+    old_pv_retain = False
+    if state.old_pv:
+        try:
+            pv = core.read_persistent_volume(state.old_pv)
+            old_pv_retain = pv.spec.persistent_volume_reclaim_policy == "Retain"
+        except ApiException as e:
+            if e.status != 404:
+                raise
+    pod_ready = any(
+        p["metadata"]["name"] == state.pod
+        and recovery.pod_view(p).ready
+        for p in pods
+    )
+
+    obs = recovery.RestoreObservation(
+        selected_snapshot=sel_name,
+        selected_size=sel_size,
+        snapshot_exists=snap_exists,
+        snapshot_ready=snap_ready,
+        check_pvc_phase=(check.get("status") or {}).get("phase") if check else None,
+        target_pods=len(pods),
+        pvc_exists=pvc is not None,
+        pvc_phase=(pvc.get("status") or {}).get("phase") if pvc else None,
+        old_pv_retain=old_pv_retain,
+        pod_ready=pod_ready,
+    )
+    prev = state.state
+    state, d = recovery.restore_step(state, obs, now, bind_timeout)
+
+    if state.state != prev and d.op not in (
+        recovery.RestoreOp.FAIL,
+        recovery.RestoreOp.COMPLETE,
+        recovery.RestoreOp.CLEAR,
+    ):
+        kopf.info(body, reason="RestoreStep", message=state.state)
+
+    if d.op is recovery.RestoreOp.CHECK_PVC_CREATE:
+        try:
+            core.create_namespaced_persistent_volume_claim(
+                namespace,
+                _pvc_body(sts, f"{state.pvc}-restore-check", state.size, state.snapshot, namespace),
+            )
+        except ApiException as e:
+            if e.status != 409:
+                raise
+    elif d.op is recovery.RestoreOp.CHECK_PVC_DELETE:
+        try:
+            core.delete_namespaced_persistent_volume_claim(
+                f"{state.pvc}-restore-check", namespace
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+    elif d.op is recovery.RestoreOp.SCALE_DOWN:
+        if state.original_replicas is None:
+            state = replace(
+                state, original_replicas=(sts.get("spec") or {}).get("replicas", 1)
+            )
+        apps.patch_namespaced_stateful_set(
+            sts["metadata"]["name"], namespace, {"spec": {"replicas": 0}}
+        )
+    elif d.op is recovery.RestoreOp.RETAIN_PV:
+        if state.old_pv is None and pvc:
+            pv_name = (pvc.get("spec") or {}).get("volumeName")
+            core.patch_persistent_volume(
+                pv_name,
+                {
+                    "spec": {"persistentVolumeReclaimPolicy": "Retain"},
+                    "metadata": {
+                        "annotations": {
+                            "recovery.iv-cmd.dev/retained-from": f"{namespace}/{state.pvc}"
+                        }
+                    },
+                },
+            )
+            state = replace(state, old_pv=pv_name)
+    elif d.op is recovery.RestoreOp.PVC_DELETE:
+        try:
+            core.delete_namespaced_persistent_volume_claim(state.pvc, namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+    elif d.op is recovery.RestoreOp.PVC_CREATE:
+        try:
+            core.create_namespaced_persistent_volume_claim(
+                namespace,
+                _pvc_body(sts, state.pvc, state.size, state.snapshot, namespace),
+            )
+        except ApiException as e:
+            if e.status != 409:
+                raise
+    elif d.op is recovery.RestoreOp.SCALE_UP:
+        apps.patch_namespaced_stateful_set(
+            sts["metadata"]["name"],
+            namespace,
+            {"spec": {"replicas": state.original_replicas or 1}},
+        )
+    elif d.op is recovery.RestoreOp.COMPLETE:
+        duration = int((now - state.started_at).total_seconds()) if state.started_at else 0
+        kopf.info(
+            body,
+            reason="RestoreCompleted",
+            message=f"{state.pvc} restored from {state.snapshot} in {duration}s",
+        )
+        patch.status["phase"] = "Ready"
+        patch.status["lastRestoreTime"] = now.isoformat()
+        patch.status["lastRestoreSnapshot"] = state.snapshot
+    elif d.op is recovery.RestoreOp.FAIL:
+        kopf.warn(
+            body,
+            reason="RestoreFailed",
+            message=(
+                f"{d.reason}; snapshot={state.snapshot or 'none'}, "
+                f"retained PV={state.old_pv or 'none'}"
+            ),
+        )
+        patch.status["phase"] = "Failed"
+    else:
+        logger.debug(f"{name}: restore {d.op.value} {d.reason}")
+
+    if d.op is recovery.RestoreOp.COMPLETE and state.pod in mems:
+        mem = replace(
+            mems[state.pod],
+            restarts=0,
+            deleted_uid=None,
+            unready_since=None,
+            failing_since=None,
+            escalated=False,
+            restored=True,
+        )
+        entry = recovery.to_status(mem)
+        for k in (stored.get(state.pod) or {}):
+            entry.setdefault(k, None)
+        pods_status = dict(stored)
+        pods_status[state.pod] = entry
+        rec_status = dict(rec)
+        rec_status["pods"] = pods_status
+    else:
+        rec_status = dict(rec)
+
+    new_restore = recovery.restore_to_status(state)
+    if d.op is recovery.RestoreOp.CLEAR:
+        new_restore = None
+    if new_restore is not None:
+        for k in rec["restore"]:
+            new_restore.setdefault(k, None)
+    rec_status["restore"] = new_restore
+    patch.status["recovery"] = rec_status
 
 
 def _node_view(node: dict, fenced_by: str) -> recovery.NodeView:

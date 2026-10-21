@@ -94,6 +94,20 @@ spec:
                           description: How long to wait for pods and VolumeAttachments to clear before warning.
                           type: integer
                           default: 180
+                    restore:
+                      type: object
+                      # default {} so the field defaults apply even when restore is omitted.
+                      default: {}
+                      properties:
+                        enabled:
+                          description: Restore the PVC from the newest good snapshot when restarts run out.
+                          type: boolean
+                          default: false
+                        bindTimeoutSeconds:
+                          description: How long to wait for a restore PVC to bind before giving up.
+                          type: integer
+                          minimum: 30
+                          default: 180
                     dryRun:
                       description: Log recovery actions without executing them.
                       type: boolean

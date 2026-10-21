@@ -22,8 +22,9 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [persistentvolumes]
-    # needed to map a PV to the PVC that a VolumeAttachment carries
-    verbs: [get, list]
+    # get/list maps a PV to the PVC a VolumeAttachment carries; patch sets
+    # persistentVolumeReclaimPolicy=Retain during a restore
+    verbs: [get, list, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

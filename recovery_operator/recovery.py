@@ -337,3 +337,216 @@ def fence_from_status(d: dict | None) -> FenceMemory:
         refused=d.get("refused", False),
         warned_unverified=d.get("warnedUnverified", False),
     )
+
+
+class RestoreOp(Enum):
+    CHECK_PVC_CREATE = "CHECK_PVC_CREATE"
+    CHECK_PVC_DELETE = "CHECK_PVC_DELETE"
+    SCALE_DOWN = "SCALE_DOWN"
+    RETAIN_PV = "RETAIN_PV"
+    PVC_DELETE = "PVC_DELETE"
+    PVC_CREATE = "PVC_CREATE"
+    SCALE_UP = "SCALE_UP"
+    COMPLETE = "COMPLETE"
+    FAIL = "FAIL"
+    CLEAR = "CLEAR"
+    WAIT = "WAIT"
+
+
+@dataclass(frozen=True)
+class RestoreState:
+    """Stored in status.recovery.restore; one restore at a time."""
+
+    state: str | None = None
+    pvc: str | None = None
+    pod: str | None = None
+    snapshot: str | None = None
+    size: str | None = None
+    original_replicas: int | None = None
+    old_pv: str | None = None
+    started_at: datetime | None = None
+    step_started_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class RestoreObservation:
+    """Fresh reads for the current tick; snapshot fields are for state.snapshot."""
+
+    selected_snapshot: str | None = None
+    selected_size: str | None = None
+    snapshot_exists: bool = True
+    snapshot_ready: bool = True
+    check_pvc_phase: str | None = None
+    target_pods: int = 0
+    pvc_exists: bool = False
+    pvc_phase: str | None = None
+    old_pv_retain: bool = False
+    pod_ready: bool = False
+
+
+@dataclass(frozen=True)
+class RestoreDecision:
+    op: RestoreOp
+    reason: str
+
+
+def _restore_to(state: RestoreState, new_state: str, now: datetime) -> RestoreState:
+    return replace(state, state=new_state, step_started_at=now)
+
+
+def restore_step(
+    state: RestoreState,
+    obs: RestoreObservation,
+    now: datetime,
+    bind_timeout: int,
+) -> tuple[RestoreState, RestoreDecision]:
+    """Advance the restore one step. Every decision re-checks reality, so a
+    restart at any point resumes."""
+    expired = (
+        state.step_started_at is not None
+        and (now - state.step_started_at).total_seconds() > bind_timeout
+    )
+
+    def fail(reason: str) -> tuple[RestoreState, RestoreDecision]:
+        return _restore_to(state, "RestoreFailed", now), RestoreDecision(
+            RestoreOp.FAIL, reason
+        )
+
+    if state.state == "Selected":
+        if not obs.selected_snapshot:
+            return fail("no restorable snapshot")
+        return _restore_to(
+            replace(state, snapshot=obs.selected_snapshot, size=obs.selected_size),
+            "Validating",
+            now,
+        ), RestoreDecision(RestoreOp.CHECK_PVC_CREATE, "snapshot selected")
+
+    if state.state == "Validating":
+        if not obs.snapshot_exists or not obs.snapshot_ready:
+            return fail("snapshot gone or not ready")
+        if obs.check_pvc_phase == "Bound":
+            return _restore_to(state, "ScalingDown", now), RestoreDecision(
+                RestoreOp.CHECK_PVC_DELETE, "check PVC bound, deleting it"
+            )
+        if obs.check_pvc_phase is None:
+            return state, RestoreDecision(
+                RestoreOp.CHECK_PVC_CREATE, "proving the snapshot restores"
+            )
+        if expired:
+            return fail(f"check PVC not Bound after {bind_timeout}s")
+        return state, RestoreDecision(RestoreOp.WAIT, "check PVC binding")
+
+    if state.state == "ScalingDown":
+        if obs.target_pods == 0:
+            return _restore_to(state, "RetainingOldPv", now), RestoreDecision(
+                RestoreOp.RETAIN_PV, "pods gone, retaining the old PV"
+            )
+        return state, RestoreDecision(RestoreOp.SCALE_DOWN, "scaling to 0")
+
+    if state.state == "RetainingOldPv":
+        if obs.old_pv_retain:
+            return _restore_to(state, "DeletingOldPvc", now), RestoreDecision(
+                RestoreOp.PVC_DELETE, "old PV retained, deleting the PVC"
+            )
+        return state, RestoreDecision(RestoreOp.RETAIN_PV, "setting Retain")
+
+    if state.state == "DeletingOldPvc":
+        if not obs.pvc_exists:
+            return _restore_to(state, "CreatingPvc", now), RestoreDecision(
+                RestoreOp.PVC_CREATE, "old PVC gone, creating from snapshot"
+            )
+        return state, RestoreDecision(RestoreOp.PVC_DELETE, "deleting old PVC")
+
+    if state.state == "CreatingPvc":
+        if obs.pvc_phase == "Bound":
+            return _restore_to(state, "ScalingUp", now), RestoreDecision(
+                RestoreOp.SCALE_UP, "restored PVC bound, scaling back up"
+            )
+        if not obs.pvc_exists:
+            return state, RestoreDecision(
+                RestoreOp.PVC_CREATE, "creating PVC from snapshot"
+            )
+        if expired:
+            # leave the StatefulSet at 0: scaling up would provision an empty PVC
+            return fail(f"PVC not Bound after {bind_timeout}s")
+        return state, RestoreDecision(RestoreOp.WAIT, "PVC binding")
+
+    if state.state == "ScalingUp":
+        if obs.pod_ready:
+            return _restore_to(state, "Restored", now), RestoreDecision(
+                RestoreOp.COMPLETE, "pod is Ready"
+            )
+        return state, RestoreDecision(RestoreOp.SCALE_UP, "waiting for pod")
+
+    if state.state == "Restored":
+        return _restore_to(state, "Done", now), RestoreDecision(
+            RestoreOp.CLEAR, "restore done, clearing status"
+        )
+
+    return state, RestoreDecision(RestoreOp.WAIT, f"state {state.state}")
+
+
+def quantity_bytes(q: str | None) -> int:
+    """Parse a k8s resource quantity into bytes. Unknown formats return 0."""
+    if not q:
+        return 0
+    units = {
+        "Ki": 2**10,
+        "Mi": 2**20,
+        "Gi": 2**30,
+        "Ti": 2**40,
+        "k": 10**3,
+        "M": 10**6,
+        "G": 10**9,
+        "T": 10**12,
+    }
+    for suffix, mult in units.items():
+        if q.endswith(suffix):
+            try:
+                return int(float(q[: -len(suffix)]) * mult)
+            except ValueError:
+                return 0
+    try:
+        return int(float(q))
+    except ValueError:
+        return 0
+
+
+def restore_to_status(state: RestoreState) -> dict:
+    """Serialize a RestoreState for status.recovery.restore."""
+    out = {
+        "state": state.state,
+        "pvc": state.pvc,
+        "pod": state.pod,
+        "snapshot": state.snapshot,
+        "size": state.size,
+        "originalReplicas": state.original_replicas,
+        "oldPv": state.old_pv,
+        "startedAt": state.started_at.isoformat() if state.started_at else None,
+        "stepStartedAt": (
+            state.step_started_at.isoformat() if state.step_started_at else None
+        ),
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def restore_from_status(d: dict | None) -> RestoreState:
+    """Load a RestoreState from status.recovery.restore."""
+    d = d or {}
+    return RestoreState(
+        state=d.get("state"),
+        pvc=d.get("pvc"),
+        pod=d.get("pod"),
+        snapshot=d.get("snapshot"),
+        size=d.get("size"),
+        original_replicas=d.get("originalReplicas"),
+        old_pv=d.get("oldPv"),
+        started_at=(
+            datetime.fromisoformat(d["startedAt"]) if d.get("startedAt") else None
+        ),
+        step_started_at=(
+            datetime.fromisoformat(d["stepStartedAt"])
+            if d.get("stepStartedAt")
+            else None
+        ),
+    )
