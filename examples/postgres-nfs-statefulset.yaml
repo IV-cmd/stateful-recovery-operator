@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-nfs
+spec:
+  clusterIP: None
+  selector:
+    app: pg-nfs
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg-nfs
+spec:
+  serviceName: pg-nfs
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg-nfs
+  template:
+    metadata:
+      labels:
+        app: pg-nfs
+    spec:
+      securityContext:
+        # csi-driver-nfs supports fsGroup (fsGroupPolicy: File); this chowns the
+        # PV subdir so Postgres can write to it
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteMany"]
+        storageClassName: nfs-csi
+        resources:
+          requests:
+            storage: 1Gi
