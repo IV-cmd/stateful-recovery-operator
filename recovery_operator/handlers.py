@@ -183,7 +183,8 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
                         reason="RecoveryDryRun",
                         message=f"would delete {pname}: {d.reason}",
                     )
-                    mem = replace(mem, dry_run_uid=view.uid)
+                # count the would-be restart so maxRestarts still gates
+                mem = replace(mem, dry_run_uid=view.uid, restarts=mem.restarts + 1)
             else:
                 try:
                     client.CoreV1Api().delete_namespaced_pod(pname, namespace)
