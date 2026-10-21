@@ -357,7 +357,7 @@ def fencing_timer(spec, status, name, namespace, body, patch, logger, **_):
         else:
             logger.debug(f"{name}/{node_name}: {d.action.value} {d.reason}")
 
-        desired[node_name] = recovery.fence_to_status(mem)
+        desired[node_name] = recovery.fence_to_status(mem) if mem.state else None
 
     for n in stored:
         if n not in desired:
