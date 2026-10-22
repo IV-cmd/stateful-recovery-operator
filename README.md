@@ -39,13 +39,35 @@ To clear the failed state and let the operator try again:
 kubectl patch rp <name> --subresource=status --type=merge -p '{"status":{"phase":"Ready","recovery":{"restore":null}}}'
 ```
 
+## Observability
+
+Run `make monitoring` to install Prometheus and Grafana in the `monitoring` namespace. Both run on the control-plane node, so a fence on a worker can't evict them. The operator serves metrics on port 8000 (`METRICS_PORT`). Prometheus scrapes it at the kind gateway `172.18.0.1:8000`. On Docker Desktop, run `make monitoring METRICS_TARGET=host.docker.internal:8000` instead (untested).
+
+The dashboard `dashboards/recovery.json` loads automatically. Port-forward `svc/grafana 3000` to open it. The screenshot shows one restart, one restore, and one fence:
+
+![Recovery dashboard after a restart, a restore, and a fence](dashboards/recovery.png)
+
+Useful queries:
+
+- `time() - backup_last_success_timestamp_seconds`: the age of the newest ready snapshot, which is the data you would lose now.
+- `histogram_quantile(0.5, sum by (le, action) (rate(recovery_duration_seconds_bucket[1h])))`: the median recovery time per action.
+- `sum by (action, result) (recovery_actions_total)`: the count of each recovery outcome.
+
 ## Architecture
 
 TODO: document the controller flow once M1 lands.
 
 ## Measured recovery times
 
-TODO: fill in after the e2e milestones run.
+Measured on kind with the operator's `recovery_duration_seconds` histogram:
+
+| Action | Measured from | Time |
+|---|---|---|
+| Pod restart | Pod delete to Ready | 10s |
+| Node fence | Taint to verified | 10–20s |
+| Restore | Restore start to pod Ready | 80s |
+
+A node fence also waits about 2 minutes after the node stops: about 48s until Kubernetes marks it NotReady, then `notReadySeconds`. With backups every 2 minutes, the backup age stays below 4 minutes.
 
 ## RBAC trade-offs
 
