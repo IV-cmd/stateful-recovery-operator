@@ -26,3 +26,24 @@ jobs:
         with:
           python-version: "3.11"
       - run: python scripts/ste-lint.py --baseline 5 README.md LEARNING_LOG.md
+
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/iv-cmd/stateful-recovery-operator:latest
+            ghcr.io/iv-cmd/stateful-recovery-operator:${{ github.sha }}
