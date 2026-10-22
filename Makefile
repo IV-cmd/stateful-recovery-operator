@@ -40,9 +40,10 @@ nfs:
 	kubectl apply -f lab/nfs-storageclass.yaml
 
 ## Deploy Prometheus + Grafana for the recovery lab
-# the operator serves /metrics on the host; 172.18.0.1 is the kind network gateway.
+# default scrapes the in-cluster operator Service; for a local `kopf run` on the
+# host use METRICS_TARGET=172.18.0.1:8000 (the kind network gateway).
 # shortcut: unverified on Docker Desktop for Mac — use METRICS_TARGET=host.docker.internal:8000 there.
-METRICS_TARGET ?= 172.18.0.1:8000
+METRICS_TARGET ?= recovery-operator-metrics.default.svc:8000
 monitoring:
 	sed 's|__METRICS_TARGET__|$(METRICS_TARGET)|' lab/monitoring.yaml | kubectl apply -f -
 	kubectl create configmap recovery-dashboard -n monitoring \

@@ -60,3 +60,16 @@ spec:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recovery-operator-metrics
+  namespace: default
+spec:
+  selector:
+    app: recovery-operator
+  ports:
+    - name: metrics
+      port: 8000
+      targetPort: metrics
