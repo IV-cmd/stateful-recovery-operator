@@ -127,7 +127,7 @@ The operator uses the ServiceAccount `recovery-operator` with a Role and a Clust
 
 ### Why fence instead of force-delete?
 
-A force delete removes the pod from the API. It doesn't stop the container on the node. On a partitioned node, the container can keep writing to the volume. Kubernetes then starts a second pod on the same RWO volume, and two writers corrupt the data. The out-of-service taint tells Kubernetes that the node is down. Kubernetes then deletes the pods and detaches their volumes. The operator checks that the pod and the VolumeAttachments are gone before it reports `FenceVerified`.
+A force delete deletes the pod object from the API. It doesn't stop the container on the node. On a partitioned node, the container can keep writing to the volume. Kubernetes then starts a second pod on the same RWO volume, and two writers corrupt the data. The out-of-service taint tells Kubernetes that the node is down. Kubernetes then deletes the pods and detaches their volumes. The operator checks that the pod and the VolumeAttachments are gone before it reports `FenceVerified`.
 
 ### What if the node is only partitioned?
 
