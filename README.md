@@ -108,7 +108,17 @@ The operator uses the ServiceAccount `recovery-operator` with a Role and a Clust
 - The ClusterRole covers cluster-scoped objects: nodes, PVs, VolumeAttachments, and CSIDrivers. A Role can't grant access to them.
 - Fencing needs `update` on nodes, not `patch`. The fence reads the node, edits the taint list, and replaces the node. A merge patch would replace the whole taint list.
 - Kopf needs list and watch on namespaces and CRDs at cluster scope. The pod logs showed each of these as a 403. These grants only allow reads.
-- `kubectl auth can-i` checks that the operator can't delete nodes or VolumeAttachments, read Secrets, or create pods.
+- `kubectl auth can-i` checks what the operator can't do:
+
+  ```text
+  $ kubectl auth can-i <verb> <resource> --as=system:serviceaccount:default:recovery-operator
+  delete nodes                    no
+  delete volumeattachments        no
+  get secrets                     no
+  create pods                     no
+  delete pods -n kube-system      no
+  ```
+
 - The widest grant is `update` on nodes. It allows any change to a node spec, for example removing an admin taint. An admission policy could limit it to the out-of-service taint. The lab doesn't do this.
 
 ## Known limitations
@@ -117,6 +127,7 @@ The operator uses the ServiceAccount `recovery-operator` with a Role and a Clust
 - The out-of-service taint states that a node is dead. It doesn't prove it. A partitioned node can still write to the volume. Production needs out-of-band proof, such as the power state from the BMC or the cloud API.
 - The operator can't detect a snapshot taken after corruption started but before the operator saw the failure. It restores that snapshot, the pod misses its ready timeout, and the operator reports `RestoreFailed`. A human must select a good snapshot.
 - The operator runs as 1 replica. While its pod restarts, no backup, restart, or fence happens.
+- The recovery timer doesn't check for a StatefulSet rollout. During a rollout, it can delete a failing pod that the StatefulSet would replace anyway. Each extra delete adds a restart and counts toward `maxRestarts`. A restore can then start sooner than necessary.
 - The operator refuses to fence when more than one node is unhealthy. This rule blocks recovery when a whole rack fails.
 - The tests cover restore only on a single-replica Postgres on hostpath storage.
 - The operator watches only the `default` namespace.
