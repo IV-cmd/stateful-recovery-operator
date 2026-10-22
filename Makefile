@@ -6,7 +6,7 @@ HOSTPATH_VERSION := v1.18.0
 # pinned csi-driver-nfs release; the lab manifests under lab/ target it
 NFS_DRIVER_VERSION := v4.13.5
 
-.PHONY: help cluster cluster-delete csi nfs monitoring lint typecheck test deploy graph lint-docs
+.PHONY: help cluster cluster-delete csi nfs monitoring lint typecheck test deploy undeploy image graph lint-docs
 
 ## Show this help
 help:
@@ -60,8 +60,24 @@ test:
 	# shortcut: no tests yet (pytest exit 5), drop this once M1 adds unit tests
 	pytest -q || [ $$? -eq 5 ]
 
-## Apply the manifests in deploy/
-deploy: ; kubectl apply -f deploy/
+## Build the operator image and load it into kind
+image:
+	docker build -t ghcr.io/iv-cmd/stateful-recovery-operator:latest .
+	kind load docker-image ghcr.io/iv-cmd/stateful-recovery-operator:latest --name recovery-lab
+
+## Build the image, apply deploy/, and restart the operator pod
+deploy: image
+	# kind load keeps the same tag, so a running pod needs an explicit restart
+	exists=$$(kubectl get deploy/recovery-operator -o name 2>/dev/null); \
+	kubectl apply -f deploy/; \
+	if [ -n "$$exists" ]; then kubectl rollout restart deploy/recovery-operator; fi; \
+	kubectl rollout status deploy/recovery-operator --timeout=180s
+
+## Remove the operator and its RBAC
+undeploy:
+	# never the CRD: deleting it deletes every RecoveryPolicy and its data
+	kubectl delete -f deploy/operator.yaml --ignore-not-found
+	kubectl delete -f deploy/rbac.yaml --ignore-not-found
 
 ## Build the knowledge graph into graphify-out/
 # graphify CLI: uv tool install graphifyy   or   pipx install graphifyy

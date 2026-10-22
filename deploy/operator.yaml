@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recovery-operator
+  namespace: default
+spec:
+  replicas: 1
+  # two operators acting on the same objects is worse than a short gap
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: recovery-operator
+  template:
+    metadata:
+      labels:
+        app: recovery-operator
+    spec:
+      serviceAccountName: recovery-operator
+      # pin to the control plane: a fence of the operator's own node would evict it
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: operator
+          image: ghcr.io/iv-cmd/stateful-recovery-operator:latest
+          imagePullPolicy: IfNotPresent
+          command: ["kopf"]
+          args:
+            - run
+            - --standalone
+            - -n
+            - default
+            - --liveness=http://0.0.0.0:8080/healthz
+            - -m
+            - recovery_operator.handlers
+          env:
+            - name: METRICS_PORT
+              value: "8000"
+          ports:
+            - name: metrics
+              containerPort: 8000
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true

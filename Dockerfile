@@ -8,6 +8,7 @@ COPY recovery_operator/ recovery_operator/
 RUN pip install --no-cache-dir .
 
 RUN useradd --system --uid 10001 sro
-USER sro
+# numeric uid so runAsNonRoot can verify it
+USER 10001
 
 CMD ["kopf", "run", "--standalone", "-m", "recovery_operator.handlers"]
