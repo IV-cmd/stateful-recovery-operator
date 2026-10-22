@@ -1,6 +1,6 @@
-# Cluster scope: nodes and VolumeAttachments are cluster-scoped objects, so a
-# namespaced Role cannot grant access to them. A namespaced Role for the pod
-# and snapshot work comes in M7.
+# Namespaced rules cover the workload objects. Cluster rules cover nodes, PVs
+# and the CSI objects. Every rule names its caller; kopf's own access (watching
+# RecoveryPolicies, posting Events) is granted where the pod's logs showed a 403.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -8,32 +8,87 @@ metadata:
   namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: recovery-operator
+  namespace: default
+rules:
+  # kopf watches and patches the RecoveryPolicy objects it serves
+  - apiGroups: [recovery.iv-cmd.dev]
+    resources: [recoverypolicies]
+    verbs: [get, list, watch, patch]
+  # kopf patches status through the status subresource
+  - apiGroups: [recovery.iv-cmd.dev]
+    resources: [recoverypolicies/status]
+    verbs: [patch]
+  # handlers.py: read the StatefulSet; _restore_drive scales it during a restore
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, patch]
+  # recovery_timer lists pods for observe() and deletes them on RESTART
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, delete]
+  # _restore_drive reads/creates/deletes the PVC and its restore-check PVC
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, create, delete]
+  # backup.py lists/creates/deletes VolumeSnapshots; _restore_drive reads one
+  # during Validating via get_namespaced_custom_object
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshots]
+    verbs: [get, list, create, delete]
+  # kopf.info/kopf.warn post Events
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: recovery-operator
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: recovery-operator
+subjects:
+  - kind: ServiceAccount
+    name: recovery-operator
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: recovery-operator-fencing
+  name: recovery-operator
 rules:
+  # k8s.py replace_node writes taints read-modify-write (fence_node/unfence_node);
+  # list_nodes feeds the recovery node_ready check and the fencing timer
   - apiGroups: [""]
     resources: [nodes]
-    # taints live in spec.taints, so plain patch is enough; nodes/status is
-    # not needed because we only read conditions
-    verbs: [get, list, watch, patch]
-  - apiGroups: [storage.k8s.io]
-    resources: [volumeattachments]
-    verbs: [get, list, watch]
+    verbs: [get, list, update]
+  # _restore_drive patches persistentVolumeReclaimPolicy=Retain; k8s.py and
+  # fencing list PVs for pod→PV and VolumeAttachment checks
   - apiGroups: [""]
     resources: [persistentvolumes]
-    # get/list maps a PV to the PVC a VolumeAttachment carries; patch sets
-    # persistentVolumeReclaimPolicy=Retain during a restore
     verbs: [get, list, patch]
+  # fencing_timer's verify step checks the node has no remaining attachments
+  - apiGroups: [storage.k8s.io]
+    resources: [volumeattachments]
+    verbs: [list]
+  # handlers.py read_csi_driver checks whether a PVC's driver supports snapshots
+  - apiGroups: [storage.k8s.io]
+    resources: [csidrivers]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: recovery-operator-fencing
+  name: recovery-operator
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: recovery-operator-fencing
+  name: recovery-operator
 subjects:
   - kind: ServiceAccount
     name: recovery-operator
