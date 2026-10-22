@@ -46,6 +46,18 @@ DURATIONS = Histogram(
 _started = False
 
 
+def init_policy(ns: str, policy: str) -> None:
+    """Pre-create the labeled children so increase() sees the first event."""
+    for action in ("restart", "fence", "restore"):
+        for result in ("started", "succeeded", "failed", "escalated", "refused", "dry_run"):
+            ACTIONS.labels(ns, policy, action, result)
+        DURATIONS.labels(ns, policy, action)
+    for result in ("created", "skipped_pending", "skipped_unhealthy", "error"):
+        BACKUPS.labels(ns, policy, result)
+    for result in ("deleted", "failed"):
+        PRUNED.labels(ns, policy, result)
+
+
 def start(port: int, addr: str = "0.0.0.0") -> bool:
     """Start the /metrics HTTP server once. Never raises."""
     global _started

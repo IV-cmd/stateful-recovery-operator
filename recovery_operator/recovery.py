@@ -31,6 +31,7 @@ class PodMemory:
     unready_since: datetime | None = None
     restarts: int = 0
     deleted_uid: str | None = None
+    deleted_at: datetime | None = None
     dry_run_uid: str | None = None
     escalated: bool = False
     failing_since: datetime | None = None
@@ -86,6 +87,7 @@ def observe(pod: PodView, mem: PodMemory, now: datetime) -> tuple[PodMemory, boo
             mem,
             unready_since=None,
             deleted_uid=None,
+            deleted_at=None,
             restarts=0,
             escalated=False,
             failing_since=None,
@@ -136,6 +138,7 @@ def to_status(mem: PodMemory) -> dict:
         "unreadySince": mem.unready_since.isoformat() if mem.unready_since else None,
         "restarts": mem.restarts,
         "deletedUid": mem.deleted_uid,
+        "deletedAt": mem.deleted_at.isoformat() if mem.deleted_at else None,
         "dryRunUid": mem.dry_run_uid,
         "escalated": mem.escalated,
         "failingSince": mem.failing_since.isoformat() if mem.failing_since else None,
@@ -154,6 +157,9 @@ def from_status(d: dict | None) -> PodMemory:
         unready_since=datetime.fromisoformat(since) if since else None,
         restarts=d.get("restarts", 0),
         deleted_uid=d.get("deletedUid"),
+        deleted_at=(
+            datetime.fromisoformat(d["deletedAt"]) if d.get("deletedAt") else None
+        ),
         dry_run_uid=d.get("dryRunUid"),
         escalated=d.get("escalated", False),
         failing_since=(

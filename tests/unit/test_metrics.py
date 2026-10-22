@@ -32,3 +32,27 @@ def test_recovery_py_has_no_prometheus_import():
 def test_duration_buckets():
     finite = [b for b in metrics.DURATIONS._upper_bounds if b != float("inf")]
     assert finite == [1, 2, 5, 10, 15, 30, 60, 90, 120, 180, 300, 600, 1200]
+
+
+def test_init_policy_creates_zero_samples():
+    metrics.init_policy("ns1", "pol1")
+    samples = {
+        (s.labels["action"], s.labels["result"])
+        for s in metrics.ACTIONS.collect()[0].samples
+        if s.labels["namespace"] == "ns1" and s.labels["policy"] == "pol1"
+    }
+    assert len(samples) == 18
+    backup_results = {
+        s.labels["result"]
+        for s in metrics.BACKUPS.collect()[0].samples
+        if s.labels["namespace"] == "ns1" and s.labels["policy"] == "pol1"
+    }
+    assert backup_results == {"created", "skipped_pending", "skipped_unhealthy", "error"}
+    durations = {
+        s.labels["action"]
+        for s in metrics.DURATIONS.collect()[0].samples
+        if s.labels["namespace"] == "ns1"
+        and s.labels["policy"] == "pol1"
+        and s.name.endswith("_count")
+    }
+    assert durations == {"restart", "fence", "restore"}

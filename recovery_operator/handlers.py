@@ -42,6 +42,7 @@ def on_delete(name, namespace, patch, logger, **_):
 
 @kopf.timer(*RESOURCE, interval=60, initial_delay=5)
 def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
+    metrics.init_policy(namespace, name)
     schedule = spec.get("backup", {}).get("schedule")
     if not schedule:
         return
@@ -61,6 +62,20 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
         return
     sts = ApiClient().sanitize_for_serialization(sts)
 
+    for pvc in backup.pvc_names(sts):
+        ready = [
+            s
+            for s in backup.list_snapshots(namespace, name, pvc)
+            if (s.get("status") or {}).get("readyToUse")
+        ]
+        if ready:
+            newest = max(ready, key=lambda s: s["metadata"]["creationTimestamp"])
+            metrics.BACKUP_LAST_SUCCESS.labels(namespace, name, pvc).set(
+                datetime.fromisoformat(
+                    newest["metadata"]["creationTimestamp"]
+                ).timestamp()
+            )
+
     rec = status.get("recovery") or {}
     unhealthy = rec.get("restore") or any(
         (p or {}).get("failingSince") for p in (rec.get("pods") or {}).values()
@@ -68,17 +83,27 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
     if unhealthy:
         # never snapshot a possibly corrupted workload
         kopf.info(body, reason="BackupSkipped", message="workload unhealthy")
+        metrics.BACKUPS.labels(namespace, name, "skipped_unhealthy").inc()
         return
 
     if any(backup.is_pending(s) for s in backup.list_snapshots(namespace, name)):
         logger.info(f"{name}: a snapshot is still pending, skipping this tick")
         kopf.info(body, reason="BackupSkipped", message="a snapshot is still pending")
+        metrics.BACKUPS.labels(namespace, name, "skipped_pending").inc()
         return
 
     for pvc in backup.pvc_names(sts):
         snap_name = backup.snapshot_name(name, pvc, slot)
-        if backup.create_snapshot(namespace, backup.snapshot_body(snap_name, name, pvc)):
+        try:
+            created = backup.create_snapshot(
+                namespace, backup.snapshot_body(snap_name, name, pvc)
+            )
+        except ApiException:
+            metrics.BACKUPS.labels(namespace, name, "error").inc()
+            raise
+        if created:
             kopf.info(body, reason="BackupCreated", message=snap_name)
+            metrics.BACKUPS.labels(namespace, name, "created").inc()
         else:
             logger.info(f"{snap_name} already exists, skipping")
 
@@ -94,8 +119,10 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
                     backup.delete_snapshot(namespace, snap_name)
                 except ApiException as e:
                     kopf.warn(body, reason="PruneFailed", message=f"{snap_name}: {e.reason}")
+                    metrics.PRUNED.labels(namespace, name, "failed").inc()
                     continue
                 kopf.info(body, reason="BackupPruned", message=snap_name)
+                metrics.PRUNED.labels(namespace, name, "deleted").inc()
 
     patch.status["lastBackupTime"] = slot.isoformat()
     if status.get("phase") != "Failed":
@@ -104,6 +131,7 @@ def backup_timer(spec, status, name, namespace, body, patch, logger, **_):
 
 @kopf.timer(*RESOURCE, interval=10, initial_delay=5)
 def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
+    metrics.init_policy(namespace, name)
     sts_name = spec["targetRef"]["name"]
     try:
         sts_obj = client.AppsV1Api().read_namespaced_stateful_set(sts_name, namespace)
@@ -126,6 +154,11 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
 
     rec = status.get("recovery") or {}
     stored = rec.get("pods") or {}
+    restore_state = (rec.get("restore") or {}).get("state")
+    metrics.ACTIVE_RECOVERIES.labels(namespace, name).set(
+        sum(1 for d in stored.values() if (d or {}).get("deletedUid"))
+        + (1 if restore_state and restore_state != "RestoreFailed" else 0)
+    )
     mems = {n: recovery.from_status(d) for n, d in stored.items()}
     rspec = spec.get("recovery") or {}
     policy = recovery.Policy(
@@ -168,12 +201,16 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
         view = recovery.pod_view(
             pod, node_ready=node_name is None or node_name in ready_nodes
         )
-        mem, recovered = recovery.observe(
-            view, mems.get(pname, recovery.PodMemory()), now
-        )
+        prev = mems.get(pname, recovery.PodMemory())
+        mem, recovered = recovery.observe(view, prev, now)
         if recovered:
             recovered_any = True
             kopf.info(body, reason="RecoveryCompleted", message=f"{pname} is Ready")
+            metrics.ACTIONS.labels(namespace, name, "restart", "succeeded").inc()
+            if prev.deleted_at:
+                metrics.DURATIONS.labels(namespace, name, "restart").observe(
+                    (now - prev.deleted_at).total_seconds()
+                )
         in_flight = sum(
             1 for n, m in mems.items() if n != pname and m.deleted_uid
         )
@@ -186,6 +223,9 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
                         reason="RecoveryDryRun",
                         message=f"would delete {pname}: {d.reason}",
                     )
+                    metrics.ACTIONS.labels(
+                        namespace, name, "restart", "dry_run"
+                    ).inc()
                 # count the would-be restart so maxRestarts still gates
                 mem = replace(mem, dry_run_uid=view.uid, restarts=mem.restarts + 1)
             else:
@@ -199,7 +239,13 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
                     reason="RecoveryStarted",
                     message=f"deleted {pname}: {d.reason}",
                 )
-                mem = replace(mem, deleted_uid=view.uid, restarts=mem.restarts + 1)
+                metrics.ACTIONS.labels(namespace, name, "restart", "started").inc()
+                mem = replace(
+                    mem,
+                    deleted_uid=view.uid,
+                    deleted_at=now,
+                    restarts=mem.restarts + 1,
+                )
                 last_action = f"RESTART {pname}: {d.reason}"
         elif d.action is recovery.Action.RESTORE:
             pvc = _pvc_for_pod(sts, pname)
@@ -220,6 +266,9 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
                             "(validate, scale to 0, retain PV, recreate PVC, scale up)"
                         ),
                     )
+                    metrics.ACTIONS.labels(
+                        namespace, name, "restore", "dry_run"
+                    ).inc()
                     mem = replace(mem, restore_dry_run=True)
             else:
                 state = recovery.RestoreState(
@@ -234,11 +283,15 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
                     reason="RestoreStarted",
                     message=f"{pname}: {d.reason}; restoring {pvc} from a snapshot",
                 )
+                metrics.ACTIONS.labels(namespace, name, "restore", "started").inc()
                 last_action = f"RESTORE {pname}: {d.reason}"
                 rec_status_restore = recovery.restore_to_status(state)
         elif d.action is recovery.Action.ESCALATE:
             if not mem.escalated:
                 kopf.warn(body, reason="RecoveryEscalated", message=f"{pname}: {d.reason}")
+                metrics.ACTIONS.labels(
+                    namespace, name, "restart", "escalated"
+                ).inc()
                 mem = replace(mem, escalated=True)
                 patch.status["phase"] = "Failed"
                 last_action = f"ESCALATE {pname}: {d.reason}"
@@ -460,6 +513,8 @@ def _restore_drive(
             reason="RestoreCompleted",
             message=f"{state.pvc} restored from {state.snapshot} in {duration}s",
         )
+        metrics.ACTIONS.labels(namespace, name, "restore", "succeeded").inc()
+        metrics.DURATIONS.labels(namespace, name, "restore").observe(duration)
         patch.status["phase"] = "Ready"
         patch.status["lastRestoreTime"] = now.isoformat()
         patch.status["lastRestoreSnapshot"] = state.snapshot
@@ -472,6 +527,7 @@ def _restore_drive(
         except ApiException as e:
             if e.status != 404:
                 raise
+        metrics.ACTIONS.labels(namespace, name, "restore", "failed").inc()
         kopf.warn(
             body,
             reason="RestoreFailed",
@@ -559,6 +615,7 @@ def _any_attach_required(target_pvcs: set) -> bool:
 
 @kopf.timer(*RESOURCE, interval=10, initial_delay=5)
 def fencing_timer(spec, status, name, namespace, body, patch, logger, **_):
+    metrics.init_policy(namespace, name)
     rspec = spec.get("recovery") or {}
     fspec = rspec.get("fencing") or {}
     policy = recovery.FencePolicy(
@@ -603,6 +660,14 @@ def fencing_timer(spec, status, name, namespace, body, patch, logger, **_):
         return
 
     all_nodes = {n["metadata"]["name"]: n for n in k8s.list_nodes()}
+    metrics.FENCED_NODES.labels(namespace, name).set(
+        sum(
+            1
+            for n in all_nodes.values()
+            if ((n["metadata"].get("annotations") or {}).get(k8s.FENCED_BY_KEY))
+            == fenced_by
+        )
+    )
     unhealthy = {
         n["metadata"]["name"]
         for n in all_nodes.values()
@@ -648,12 +713,14 @@ def fencing_timer(spec, status, name, namespace, body, patch, logger, **_):
             k8s.fence_node(node_name, fenced_by)
             mem = replace(mem, state="Fenced")
             kopf.info(body, reason="NodeFenced", message=f"{node_name}: {d.reason}")
+            metrics.ACTIONS.labels(namespace, name, "fence", "started").inc()
         elif d.action is recovery.NodeAction.DRY_RUN:
             kopf.info(
                 body,
                 reason="NodeFenceDryRun",
                 message=f"would taint {node_name} out-of-service",
             )
+            metrics.ACTIONS.labels(namespace, name, "fence", "dry_run").inc()
         elif d.action is recovery.NodeAction.VERIFY_OK:
             seconds = (
                 int((now - mem.fenced_at).total_seconds()) if mem.fenced_at else 0
@@ -668,10 +735,14 @@ def fencing_timer(spec, status, name, namespace, body, patch, logger, **_):
                 reason="FenceVerified",
                 message=f"{node_name}: verified after {seconds}s, {note}",
             )
+            metrics.ACTIONS.labels(namespace, name, "fence", "succeeded").inc()
+            metrics.DURATIONS.labels(namespace, name, "fence").observe(seconds)
         elif d.action is recovery.NodeAction.VERIFY_TIMEOUT:
             kopf.warn(body, reason="FenceUnverified", message=f"{node_name}: {d.reason}")
+            metrics.ACTIONS.labels(namespace, name, "fence", "failed").inc()
         elif d.action is recovery.NodeAction.REFUSE:
             kopf.warn(body, reason="FenceRefused", message=f"{node_name}: {d.reason}")
+            metrics.ACTIONS.labels(namespace, name, "fence", "refused").inc()
         elif d.action is recovery.NodeAction.UNFENCE:
             k8s.unfence_node(node_name)
             kopf.info(body, reason="NodeUnfenced", message=f"{node_name}: taint removed")
