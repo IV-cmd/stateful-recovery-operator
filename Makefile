@@ -6,7 +6,7 @@ HOSTPATH_VERSION := v1.18.0
 # pinned csi-driver-nfs release; the lab manifests under lab/ target it
 NFS_DRIVER_VERSION := v4.13.5
 
-.PHONY: help cluster cluster-delete csi nfs lint typecheck test deploy graph lint-docs
+.PHONY: help cluster cluster-delete csi nfs monitoring lint typecheck test deploy graph lint-docs
 
 ## Show this help
 help:
@@ -38,6 +38,16 @@ nfs:
 	kubectl apply -f lab/nfs-server.yaml
 	kubectl rollout status deploy/nfs-server --timeout=180s
 	kubectl apply -f lab/nfs-storageclass.yaml
+
+## Deploy Prometheus + Grafana for the recovery lab
+# the operator serves /metrics on the host; 172.18.0.1 is the kind network gateway.
+# shortcut: unverified on Docker Desktop for Mac — use METRICS_TARGET=host.docker.internal:8000 there.
+METRICS_TARGET ?= 172.18.0.1:8000
+monitoring:
+	sed 's|__METRICS_TARGET__|$(METRICS_TARGET)|' lab/monitoring.yaml | kubectl apply -f -
+	kubectl create configmap recovery-dashboard -n monitoring \
+		--from-file=dashboards/recovery.json --dry-run=client -o yaml | kubectl apply -f -
+	kubectl -n monitoring rollout status deploy --timeout=180s
 
 ## Run ruff
 lint: ; ruff check .
