@@ -173,7 +173,8 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
     # a restore in progress drives itself; M3 actions stay out of its way
     if rec.get("restore"):
         _restore_drive(
-            sts, pods, mems, stored, rec, name, namespace, body, patch, logger, now, rspec
+            sts, pods, mems, stored, rec, status, name, namespace, body, patch, logger,
+            now, rspec
         )
         return
 
@@ -206,11 +207,10 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
         if recovered:
             recovered_any = True
             kopf.info(body, reason="RecoveryCompleted", message=f"{pname} is Ready")
-            metrics.ACTIONS.labels(namespace, name, "restart", "succeeded").inc()
-            if prev.deleted_at:
-                metrics.DURATIONS.labels(namespace, name, "restart").observe(
-                    (now - prev.deleted_at).total_seconds()
-                )
+            duration = recovery.restart_duration(prev, recovered, now)
+            if duration is not None:
+                metrics.ACTIONS.labels(namespace, name, "restart", "succeeded").inc()
+                metrics.DURATIONS.labels(namespace, name, "restart").observe(duration)
         in_flight = sum(
             1 for n, m in mems.items() if n != pname and m.deleted_uid
         )
@@ -349,7 +349,7 @@ def _pvc_body(sts: dict, name: str, size: str, snapshot: str, ns: str) -> dict:
 
 
 def _restore_drive(
-    sts, pods, mems, stored, rec, name, namespace, body, patch, logger, now, rspec
+    sts, pods, mems, stored, rec, status, name, namespace, body, patch, logger, now, rspec
 ):
     """Advance the in-progress restore one step per tick."""
     core = client.CoreV1Api()
@@ -508,13 +508,18 @@ def _restore_drive(
         )
     elif d.op is recovery.RestoreOp.COMPLETE:
         duration = int((now - state.started_at).total_seconds()) if state.started_at else 0
-        kopf.info(
-            body,
-            reason="RestoreCompleted",
-            message=f"{state.pvc} restored from {state.snapshot} in {duration}s",
+        counted = (
+            state.started_at is not None
+            and (status.get("lastRestoreTime") or "") >= state.started_at.isoformat()
         )
-        metrics.ACTIONS.labels(namespace, name, "restore", "succeeded").inc()
-        metrics.DURATIONS.labels(namespace, name, "restore").observe(duration)
+        if not counted:
+            kopf.info(
+                body,
+                reason="RestoreCompleted",
+                message=f"{state.pvc} restored from {state.snapshot} in {duration}s",
+            )
+            metrics.ACTIONS.labels(namespace, name, "restore", "succeeded").inc()
+            metrics.DURATIONS.labels(namespace, name, "restore").observe(duration)
         patch.status["phase"] = "Ready"
         patch.status["lastRestoreTime"] = now.isoformat()
         patch.status["lastRestoreSnapshot"] = state.snapshot
@@ -540,11 +545,13 @@ def _restore_drive(
     else:
         logger.debug(f"{name}: restore {d.op.value} {d.reason}")
 
+    rec_status: dict = {}
     if d.op is recovery.RestoreOp.COMPLETE and state.pod in mems:
         mem = replace(
             mems[state.pod],
             restarts=0,
             deleted_uid=None,
+            deleted_at=None,
             unready_since=None,
             failing_since=None,
             escalated=False,
@@ -555,10 +562,7 @@ def _restore_drive(
             entry.setdefault(k, None)
         pods_status = dict(stored)
         pods_status[state.pod] = entry
-        rec_status = dict(rec)
         rec_status["pods"] = pods_status
-    else:
-        rec_status = dict(rec)
 
     new_restore = recovery.restore_to_status(state)
     if d.op is recovery.RestoreOp.CLEAR:
@@ -760,6 +764,5 @@ def fencing_timer(spec, status, name, namespace, body, patch, logger, **_):
                 entry.setdefault(k, None)
 
     if desired != stored:
-        rec_status = dict(status.get("recovery") or {})
-        rec_status["fencing"] = desired
-        patch.status["recovery"] = rec_status
+        # patch only the fencing subkey; sibling keys belong to other timers
+        patch.status["recovery"] = {"fencing": desired}

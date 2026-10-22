@@ -11,6 +11,7 @@ from recovery_operator.recovery import (
     from_status,
     observe,
     pod_view,
+    restart_duration,
     to_status,
 )
 
@@ -198,3 +199,23 @@ def test_status_round_trip():
     assert from_status(to_status(mem)) == mem
     assert from_status(None) == PodMemory()
     assert "unreadySince" not in to_status(PodMemory())
+
+
+def test_restart_duration_real_restart():
+    prev = PodMemory(deleted_at=NOW - timedelta(seconds=42))
+    assert restart_duration(prev, True, NOW) == 42
+
+
+def test_restart_duration_restored_pod():
+    prev = PodMemory(deleted_at=NOW - timedelta(seconds=42), restored=True)
+    assert restart_duration(prev, True, NOW) is None
+
+
+def test_restart_duration_escalated_without_delete():
+    prev = PodMemory(escalated=True)
+    assert restart_duration(prev, True, NOW) is None
+
+
+def test_restart_duration_not_recovered():
+    prev = PodMemory(deleted_at=NOW - timedelta(seconds=42))
+    assert restart_duration(prev, False, NOW) is None

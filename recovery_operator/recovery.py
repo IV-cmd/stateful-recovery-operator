@@ -105,6 +105,17 @@ def observe(pod: PodView, mem: PodMemory, now: datetime) -> tuple[PodMemory, boo
     return replace(mem, uid=pod.uid), recovered
 
 
+def restart_duration(prev: PodMemory, recovered: bool, now: datetime) -> float | None:
+    """Seconds a pod took to come back Ready after we deleted it.
+
+    None when the recovery was not a restart: a restored pod, an escalation
+    that reset without a delete, or a pod still down.
+    """
+    if not (recovered and prev.deleted_at and not prev.restored):
+        return None
+    return (now - prev.deleted_at).total_seconds()
+
+
 def decide(
     pod: PodView, mem: PodMemory, policy: Policy, in_flight_others: int, now: datetime
 ) -> Decision:
