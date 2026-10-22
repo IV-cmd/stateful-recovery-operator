@@ -1,5 +1,6 @@
 """Kopf handlers that watch RecoveryPolicy objects and drive backup and recovery."""
 
+import os
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -9,7 +10,7 @@ from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
 from kubernetes.utils import parse_quantity
 
-from . import backup, k8s, recovery
+from . import backup, k8s, metrics, recovery
 
 RESOURCE = ("recovery.iv-cmd.dev", "v1alpha1", "recoverypolicies")
 
@@ -17,6 +18,7 @@ RESOURCE = ("recovery.iv-cmd.dev", "v1alpha1", "recoverypolicies")
 @kopf.on.startup()
 def on_startup(**_):
     k8s.load_config()
+    metrics.start(int(os.environ.get("METRICS_PORT", "8000")))
 
 
 @kopf.on.create(*RESOURCE)
