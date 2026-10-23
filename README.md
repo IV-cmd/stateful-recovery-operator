@@ -83,7 +83,7 @@ graph LR
 Three Kopf timers run for each RecoveryPolicy:
 
 - The backup timer creates a VolumeSnapshot on the cron schedule. It deletes ready snapshots past the retention count.
-- The recovery timer deletes a failing pod. After `maxRestarts` deletes that do not fix the pod, it escalates. If the policy enables restore, it restores the PVC from the newest ready snapshot.
+- The recovery timer deletes a failing pod. During a StatefulSet rollout, it leaves a failing pod on an old revision to the StatefulSet for `unreadySeconds`. After that, it treats the rollout as stalled and deletes the pod as usual. After `maxRestarts` deletes that do not fix the pod, it escalates. If the policy enables restore, it restores the PVC from the newest ready snapshot.
 - The fencing timer adds the `node.kubernetes.io/out-of-service` taint to a dead node. It checks that the pod and its VolumeAttachments are gone. It deletes its taint when the node is Ready again.
 
 Each timer keeps its state in its own key under `status.recovery`. A restarted operator reads that state and continues from the same step. Snapshot and PVC names are deterministic. A retried create gets a 409 and makes no second object.
@@ -127,7 +127,6 @@ The operator uses the ServiceAccount `recovery-operator` with a Role and a Clust
 - The out-of-service taint states that a node is dead. It doesn't prove it. A partitioned node can still write to the volume. Production needs out-of-band proof, such as the power state from the BMC or the cloud API.
 - The operator can't detect a snapshot taken after corruption started but before the operator saw the failure. It restores that snapshot, the pod misses its ready timeout, and the operator reports `RestoreFailed`. A human must select a good snapshot.
 - The operator runs as 1 replica. While its pod restarts, no backup, restart, or fence happens.
-- The recovery timer doesn't check for a StatefulSet rollout. During a rollout, it can delete a failing pod that the StatefulSet would replace anyway. Each extra delete adds a restart and counts toward `maxRestarts`. A restore can then start sooner than necessary.
 - The operator refuses to fence when more than one node is unhealthy. This rule blocks recovery when a whole rack fails.
 - The tests cover restore only on a single-replica Postgres on hostpath storage.
 - The operator watches only the `default` namespace.

@@ -21,6 +21,7 @@ class PodView:
     ready: bool
     crash_looping: bool
     node_ready: bool = True
+    rollout: bool = False
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,7 @@ class Decision:
     reason: str
 
 
-def pod_view(pod: dict, node_ready: bool = True) -> PodView:
+def pod_view(pod: dict, node_ready: bool = True, rollout: bool = False) -> PodView:
     """Return the fields the recovery logic needs from a pod dict."""
     meta = pod.get("metadata", {})
     status = pod.get("status") or {}
@@ -72,6 +73,7 @@ def pod_view(pod: dict, node_ready: bool = True) -> PodView:
         ready=ready,
         crash_looping=crash_looping,
         node_ready=node_ready,
+        rollout=rollout,
     )
 
 
@@ -105,6 +107,34 @@ def observe(pod: PodView, mem: PodMemory, now: datetime) -> tuple[PodMemory, boo
     return replace(mem, uid=pod.uid), recovered
 
 
+def rollout_replaces(pod: dict, sts: dict) -> bool:
+    """True when the StatefulSet controller will replace this old-revision pod."""
+    meta = pod.get("metadata", {})
+    spec = sts.get("spec") or {}
+    status = sts.get("status") or {}
+    strategy = (spec.get("updateStrategy") or {}).get("type") or "RollingUpdate"
+    if strategy != "RollingUpdate":
+        return False
+    partition = (
+        ((spec.get("updateStrategy") or {}).get("rollingUpdate") or {}).get(
+            "partition"
+        )
+        or 0
+    )
+    if int(meta["name"].rsplit("-", 1)[1]) < partition:
+        return False
+    generation = (sts.get("metadata") or {}).get("generation") or 0
+    if (status.get("observedGeneration") or 0) < generation:
+        return True
+    update_revision = status.get("updateRevision")
+    return bool(
+        update_revision
+        and update_revision != (meta.get("labels") or {}).get(
+            "controller-revision-hash"
+        )
+    )
+
+
 def restart_duration(prev: PodMemory, recovered: bool, now: datetime) -> float | None:
     """Seconds a pod took to come back Ready after we deleted it.
 
@@ -126,6 +156,10 @@ def decide(
         return Decision(Action.SKIP, "healthy")
     if not pod.node_ready:
         return Decision(Action.WAIT, "node unhealthy, left to fencing")
+    if pod.rollout:
+        unready_for = (now - mem.unready_since).total_seconds() if mem.unready_since else 0
+        if unready_for < policy.unready_seconds:
+            return Decision(Action.WAIT, "StatefulSet rollout replaces this pod")
     if pod.crash_looping:
         reason = "CrashLoopBackOff"
     else:

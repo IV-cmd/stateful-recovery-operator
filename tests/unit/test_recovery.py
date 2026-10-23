@@ -12,6 +12,7 @@ from recovery_operator.recovery import (
     observe,
     pod_view,
     restart_duration,
+    rollout_replaces,
     to_status,
 )
 
@@ -219,3 +220,94 @@ def test_restart_duration_escalated_without_delete():
 def test_restart_duration_not_recovered():
     prev = PodMemory(deleted_at=NOW - timedelta(seconds=42))
     assert restart_duration(prev, False, NOW) is None
+
+
+def sts_dict(strategy=None, partition=None, update_revision=None,
+             generation=5, observed=5):
+    strategy = strategy or {}
+    if partition is not None:
+        strategy["rollingUpdate"] = {"partition": partition}
+    sts = {
+        "metadata": {"generation": generation},
+        "spec": {"updateStrategy": strategy},
+        "status": {"observedGeneration": observed},
+    }
+    if update_revision:
+        sts["status"]["updateRevision"] = update_revision
+    return sts
+
+
+def pod_dict(name="postgres-0", revision="old-hash"):
+    return {
+        "metadata": {
+            "name": name,
+            "labels": {"controller-revision-hash": revision},
+        }
+    }
+
+
+def test_rollout_replaces_hash_differs():
+    assert rollout_replaces(pod_dict(), sts_dict(update_revision="new-hash"))
+
+
+def test_rollout_replaces_hash_equal():
+    assert not rollout_replaces(
+        pod_dict(revision="same"), sts_dict(update_revision="same")
+    )
+
+
+def test_rollout_replaces_ondelete():
+    assert not rollout_replaces(
+        pod_dict(), sts_dict(strategy={"type": "OnDelete"},
+                             update_revision="new-hash")
+    )
+
+
+def test_rollout_replaces_below_partition():
+    assert not rollout_replaces(
+        pod_dict("postgres-0"),
+        sts_dict(partition=1, update_revision="new-hash"),
+    )
+
+
+def test_rollout_replaces_at_partition():
+    assert rollout_replaces(
+        pod_dict("postgres-1"),
+        sts_dict(partition=1, update_revision="new-hash"),
+    )
+
+
+def test_rollout_replaces_generation_lag():
+    assert rollout_replaces(pod_dict(), sts_dict(generation=5, observed=4))
+
+
+def test_rollout_replaces_no_revision_no_lag():
+    assert not rollout_replaces(pod_dict(), sts_dict())
+
+
+def test_decide_rollout_waits():
+    v = replace(crashloop_view(), rollout=True)
+    d = decide(v, PodMemory(uid="u1", unready_since=NOW), POLICY, 0, NOW)
+    assert d.action is Action.WAIT
+
+
+def test_decide_rollout_stalled_restarts():
+    v = replace(crashloop_view(), rollout=True)
+    mem = PodMemory(
+        uid="u1", unready_since=NOW - timedelta(seconds=POLICY.unready_seconds + 1)
+    )
+    d = decide(v, mem, POLICY, 0, NOW)
+    assert d.action is Action.RESTART
+
+
+def test_decide_rollout_ready_skips():
+    v = replace(pod_view(ready_pod()), rollout=True)
+    d = decide(v, PodMemory(uid="u1"), POLICY, 0, NOW)
+    assert d.action is Action.SKIP
+
+
+def test_decide_rollout_node_outage_waits_for_node():
+    v = replace(crashloop_view(), rollout=True, node_ready=False)
+    d = decide(v, PodMemory(uid="u1", unready_since=NOW), POLICY, 0, NOW)
+    assert d.action is Action.WAIT
+    assert "node" in d.reason

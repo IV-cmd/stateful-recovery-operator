@@ -200,7 +200,9 @@ def recovery_timer(spec, status, name, namespace, body, patch, logger, **_):
         pname = pod["metadata"]["name"]
         node_name = (pod.get("spec") or {}).get("nodeName")
         view = recovery.pod_view(
-            pod, node_ready=node_name is None or node_name in ready_nodes
+            pod,
+            node_ready=node_name is None or node_name in ready_nodes,
+            rollout=recovery.rollout_replaces(pod, sts),
         )
         prev = mems.get(pname, recovery.PodMemory())
         mem, recovered = recovery.observe(view, prev, now)
